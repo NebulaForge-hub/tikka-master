@@ -1,0 +1,52 @@
+/**
+ * API Configuration
+ * 
+ * Central configuration for backend API endpoints
+ * 
+ * The base URL is configured via the VITE_API_BASE_URL environment variable.
+ * Defaults to http://localhost:3001 for local development.
+ */
+
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  'http://localhost:3001';
+
+export const API_CONFIG = {
+  baseUrl: API_BASE_URL,
+  endpoints: {
+    auth: {
+      nonce: '/auth/nonce',
+      verify: '/auth/verify',
+    },
+    raffles: {
+      list: '/raffles',
+      detail: (id: string) => `/raffles/${id}`,
+      events: (id: string) => `/raffles/${id}/events`,
+      metadata: '/raffles/metadata',
+      uploadImage: '/raffles/upload-image',
+    },
+    users: {
+      profile: (address: string) => `/users/${address}`,
+      history: (address: string) => `/users/${address}/history`,
+      historyExport: (address: string) => `/users/${address}/history/export?format=csv`,
+    },
+    search: '/search',
+    leaderboard: '/leaderboard',
+    stats: '/stats/platform',
+    transparencyStats: '/stats/transparency',
+    verify: '/stats/verify',
+    notifications: {
+      subscribe: '/notifications/subscribe',
+      unsubscribe: (raffleId: string) => `/notifications/subscribe/${raffleId}`,
+      list: '/notifications/subscriptions',
+    },
+    support: {
+      contact: '/support',
+    },
+    transparency: {
+      list: '/transparency',
+      entry: (requestId: string) => `/transparency/${requestId}`,
+    },
+  },
+  timeout: parseInt(import.meta.env.VITE_API_TIMEOUT || '30000', 10),
+} as const;

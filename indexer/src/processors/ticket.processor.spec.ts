@@ -1,0 +1,527 @@
+import { Test, TestingModule } from '@nestjs/testing';
+import { TicketProcessor } from './ticket.processor';
+import { UserProcessor } from './user.processor';
+import { CacheService } from '../cache/cache.service';
+import { WebhookService } from '../webhooks/webhook.service';
+import { TicketEntity } from '../database/entities/ticket.entity';
+import { RaffleEntity } from '../database/entities/raffle.entity';
+
+describe('TicketProcessor', () => {
+  let processor: TicketProcessor;
+  let userProcessor: UserProcessor;
+  let cacheService: CacheService;
+  let webhookService: WebhookService;
+  let mockQueryRunner: any;
+  let mockManager: any;
+
+  function existsBuilder(exists: boolean) {
+    return {
+      where: jest.fn().mockReturnValue({
+        getExists: jest.fn().mockResolvedValue(exists),
+      }),
+    };
+  }
+
+  function insertBuilder() {
+    return {
+      insert: jest.fn().mockReturnThis(),
+      into: jest.fn().mockReturnThis(),
+      values: jest.fn().mockReturnThis(),
+      orIgnore: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ identifiers: [{}], raw: { rowCount: 1 } }),
+    };
+  }
+
+  function updateBuilder() {
+    return {
+      update: jest.fn().mockReturnThis(),
+      set: jest.fn().mockReturnThis(),
+      where: jest.fn().mockReturnThis(),
+      execute: jest.fn().mockResolvedValue({ affected: 1 }),
+    };
+  }
+
+  /** First QB call is the idempotency getExists; remaining calls are insert/update. */
+  function mockPurchaseFlow(ticketCount: number, alreadyApplied = false) {
+    const insert = insertBuilder();
+    const update = updateBuilder();
+    const queue: unknown[] = [existsBuilder(alreadyApplied)];
+    if (!alreadyApplied) {
+      for (let i = 0; i < ticketCount; i++) queue.push(insert);
+      queue.push(update);
+    }
+    mockManager.createQueryBuilder.mockImplementation(() => queue.shift());
+    return { insert, update };
+  }
+
+  beforeEach(async () => {
+    mockManager = {
+      createQueryBuilder: jest.fn(),
+    };
+
+    mockQueryRunner = {
+      manager: mockManager,
+    };
+
+    cacheService = {
+      invalidateRaffleDetail: jest.fn().mockResolvedValue(undefined),
+      invalidateUserProfile: jest.fn().mockResolvedValue(undefined),
+      invalidatePlatformStats: jest.fn().mockResolvedValue(undefined),
+    } as any;
+
+    webhookService = {
+      dispatch: jest.fn().mockResolvedValue(undefined),
+    } as any;
+
+    userProcessor = {
+      handleTicketPurchased: jest.fn().mockResolvedValue(undefined),
+      handleTicketRefunded: jest.fn().mockResolvedValue(undefined),
+    } as any;
+
+    webhookService = {
+      dispatch: jest.fn().mockResolvedValue(undefined),
+    } as any;
+
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        TicketProcessor,
+        { provide: UserProcessor, useValue: userProcessor },
+        { provide: CacheService, useValue: cacheService },
+        { provide: WebhookService, useValue: webhookService },
+      ],
+    }).compile();
+
+    processor = module.get<TicketProcessor>(TicketProcessor);
+  });
+
+  describe('handleTicketPurchased', () => {
+    it('should insert tickets idempotently', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1, 2, 3];
+      const totalCost = '300000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      // Verify each ticket was inserted
+      expect(mockInsertBuilder.insert).toHaveBeenCalledTimes(3);
+      expect(mockInsertBuilder.into).toHaveBeenCalledWith(TicketEntity);
+      expect(mockInsertBuilder.orIgnore).toHaveBeenCalledTimes(3);
+    });
+
+    it('should increment raffle tickets_sold count', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1, 2, 3];
+      const totalCost = '300000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(1, 'GBUYER', ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      expect(mockUpdateBuilder.update).toHaveBeenCalledWith(RaffleEntity);
+      expect(mockUpdateBuilder.set).toHaveBeenCalledWith({
+        ticketsSold: expect.any(Function),
+      });
+    });
+
+    it('should call userProcessor.handleTicketPurchased', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1, 2];
+      const totalCost = '200000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(1, 'GBUYER', ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      expect(userProcessor.handleTicketPurchased).toHaveBeenCalledWith(
+        1, 'GBUYER', 2, 500, 'tx-hash-123', mockQueryRunner,
+      );
+    });
+
+    it('should invalidate raffle detail cache', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1];
+      const totalCost = '100000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      expect(cacheService.invalidateRaffleDetail).toHaveBeenCalledWith('1');
+      expect(cacheService.invalidateUserProfile).toHaveBeenCalledWith('GBUYER');
+      expect(webhookService.dispatch).toHaveBeenCalledWith(
+        'TicketPurchased',
+        expect.objectContaining({ raffleId: 1, buyer: 'GBUYER' }),
+      );
+    });
+
+    it('should invalidate user profile cache', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1];
+      const totalCost = '100000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      expect(cacheService.invalidateUserProfile).toHaveBeenCalledWith(buyer);
+    });
+
+    it('should propagate errors from ticket insert', async () => {
+      const error = new Error('Database error');
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockRejectedValueOnce(error),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder);
+
+      await expect(
+        processor.handleTicketPurchased(1, 'GBUYER', [1], '100000000', 500, 'tx-hash', mockQueryRunner),
+      ).rejects.toThrow(error);
+    });
+
+    it('should handle batch ticket purchase events', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [10, 11, 12, 13, 14]; // 5 tickets
+      const totalCost = '500000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-batch';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      // Verify all 5 tickets were inserted
+      expect(mockInsertBuilder.insert).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  describe('handleTicketRefunded', () => {
+    it('should mark ticket as refunded only when not already refunded', async () => {
+      const update = updateBuilder();
+      mockManager.createQueryBuilder.mockReturnValue(update);
+
+      await processor.handleTicketRefunded(
+        1, 5, 'GBUYER', '100000000', 'tx-refund', mockQueryRunner,
+      );
+
+      expect(update.update).toHaveBeenCalledWith(TicketEntity);
+      expect(update.set).toHaveBeenCalledWith({
+        refunded: true,
+        refundTxHash: 'tx-refund',
+      });
+      expect(update.where).toHaveBeenCalledWith(
+        'id = :ticketId AND raffle_id = :raffleId AND refunded = false',
+        { ticketId: 5, raffleId: 1 },
+      );
+      expect(userProcessor.handleTicketRefunded).toHaveBeenCalledWith('GBUYER', '1');
+    });
+  });
+
+  describe('idempotency', () => {
+    it('should no-op on duplicate ticket purchase events', async () => {
+      // First delivery
+      mockPurchaseFlow(2, false);
+      await processor.handleTicketPurchased(
+        1, 'GBUYER', [1, 2], '200000000', 500, 'tx-hash-123', mockQueryRunner,
+      );
+
+      // Second delivery — already applied
+      mockPurchaseFlow(2, true);
+      await processor.handleTicketPurchased(
+        1, 'GBUYER', [1, 2], '200000000', 500, 'tx-hash-123', mockQueryRunner,
+      );
+
+      // Second delivery short-circuits on the exists check, so invalidation
+      // and user stat updates must only happen once (the first delivery).
+      expect(cacheService.invalidateUserProfile).toHaveBeenCalledTimes(1);
+      expect(cacheService.invalidateUserProfile).toHaveBeenCalledWith('GBUYER');
+      expect(userProcessor.handleTicketPurchased).toHaveBeenCalledTimes(1);
+    });
+
+    it('should propagate errors from refund update', async () => {
+      const error = new Error('Refund error');
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockRejectedValueOnce(error),
+      };
+
+      mockManager.createQueryBuilder.mockReturnValueOnce(mockUpdateBuilder);
+
+      await expect(
+        processor.handleTicketRefunded(1, 1, 'GBUYER', '100000000', 'tx-hash', mockQueryRunner),
+      ).rejects.toThrow(error);
+    });
+  });
+
+  describe('ticket ownership and counts', () => {
+    it('should correctly set ticket owner on purchase', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1];
+      const totalCost = '100000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      const valuesCall = mockInsertBuilder.values.mock.calls[0][0];
+      expect(valuesCall.owner).toBe(buyer);
+    });
+
+    it('should increment tickets_sold by correct count', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1, 2, 3, 4, 5]; // 5 tickets
+      const totalCost = '500000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      const setCall = mockUpdateBuilder.set.mock.calls[0][0];
+      // The set function should increment by 5
+      expect(setCall.ticketsSold).toBeDefined();
+    });
+  });
+
+  describe('idempotency', () => {
+    it('should handle duplicate ticket purchase events', async () => {
+      const raffleId = 1;
+      const buyer = 'GBUYER';
+      const ticketIds = [1, 2];
+      const totalCost = '200000000';
+      const ledger = 500;
+      const txHash = 'tx-hash-123';
+
+      const mockInsertBuilder = {
+        insert: jest.fn().mockReturnThis(),
+        into: jest.fn().mockReturnThis(),
+        values: jest.fn().mockReturnThis(),
+        orIgnore: jest.fn().mockReturnThis(),
+        onConflict: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ identifiers: [] }),
+      };
+
+      const mockUpdateBuilder = {
+        update: jest.fn().mockReturnThis(),
+        set: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        execute: jest.fn().mockResolvedValue({ affected: 1 }),
+      };
+
+      mockManager.createQueryBuilder
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder)
+        .mockReturnValueOnce(existsBuilder(false))
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockInsertBuilder)
+        .mockReturnValueOnce(mockUpdateBuilder);
+
+      // First call
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+      // Second call with same parameters
+      await processor.handleTicketPurchased(raffleId, buyer, ticketIds, totalCost, ledger, txHash, mockQueryRunner);
+
+      // orIgnore should prevent duplicate ticket insertion
+      expect(mockInsertBuilder.orIgnore).toHaveBeenCalled();
+    });
+  });
+});

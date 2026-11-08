@@ -1,0 +1,322 @@
+import {
+  ArgumentsHost,
+  Catch,
+  ExceptionFilter,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from '@nestjs/common';
+import * as Sentry from '@sentry/node';
+import { FastifyReply, FastifyRequest } from 'fastify';
+import { REQUEST_ID_HEADER } from '../../middleware/request-id.middleware';
+import { getRequestId } from '../../middleware/request-context';
+
+export const ErrorCode = {
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  BAD_REQUEST: 'BAD_REQUEST',
+  UNAUTHORIZED: 'UNAUTHORIZED',
+  FORBIDDEN: 'FORBIDDEN',
+  NOT_FOUND: 'NOT_FOUND',
+  CONFLICT: 'CONFLICT',
+  RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
+  SERVICE_UNAVAILABLE: 'SERVICE_UNAVAILABLE',
+  SUPABASE_ERROR: 'SUPABASE_ERROR',
+  STELLAR_ERROR: 'STELLAR_ERROR',
+  INTERNAL_ERROR: 'INTERNAL_ERROR',
+} as const;
+
+export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
+
+export interface ApiErrorResponse {
+  statusCode: number;
+  error: ErrorCode;
+  message: string;
+  requestId?: string;
+  timestamp: string;
+  path: string;
+  details?: unknown;
+}
+
+interface ResolvedError {
+  statusCode: number;
+  message: string;
+  error: ErrorCode;
+  details?: unknown;
+}
+
+/**
+ * Safe 500 body used whenever an internal/infrastructure error occurs in production.
+ * Never includes raw error messages, SQL, constraint names, or SDK internals.
+ */
+const REDACTED_INTERNAL: Readonly<Pick<ResolvedError, 'statusCode' | 'error' | 'message'>> = {
+  statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+  error: ErrorCode.INTERNAL_ERROR,
+  message: 'An unexpected error occurred. Please try again later.',
+};
+
+const REDACTED_DEPENDENCY: Readonly<Pick<ResolvedError, 'statusCode' | 'error' | 'message'>> = {
+  statusCode: HttpStatus.BAD_GATEWAY,
+  error: ErrorCode.INTERNAL_ERROR,
+  message: 'A downstream service is temporarily unavailable.',
+};
+
+@Catch()
+export class BaseExceptionFilter implements ExceptionFilter {
+  private readonly logger = new Logger(BaseExceptionFilter.name);
+  private readonly isProd = process.env.NODE_ENV === 'production';
+
+  catch(exception: unknown, host: ArgumentsHost): void {
+    const ctx = host.switchToHttp();
+    const reply = ctx.getResponse<FastifyReply>();
+    const request = ctx.getRequest<FastifyRequest>();
+
+    const { statusCode, message, error, details } = this.resolveError(exception);
+
+    if (exception instanceof HttpException) {
+      const respObj = exception.getResponse();
+      if (typeof respObj === 'object' && respObj !== null && 'retryAfter' in respObj) {
+        reply.header('Retry-After', String((respObj as Record<string, unknown>).retryAfter));
+      }
+    }
+
+    const requestId =
+      getRequestId() ?? (request.headers?.[REQUEST_ID_HEADER] as string | undefined);
+
+    const body: ApiErrorResponse = {
+      statusCode,
+      error,
+      message,
+      requestId,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+    };
+
+    if (details !== undefined) {
+      body.details = details;
+    }
+
+    reply.status(statusCode).send(body);
+  }
+
+  private resolveError(exception: unknown): ResolvedError {
+    if (exception instanceof HttpException) {
+      return this.resolveHttpException(exception);
+    }
+
+    // Identify and log infrastructure errors before deciding what to expose.
+    if (this.isQueryFailedError(exception)) {
+      this.logger.error(
+        'Database query failed',
+        exception instanceof Error ? exception.stack : String(exception),
+      );
+      Sentry.captureException(exception);
+      return this.isProd
+        ? { ...REDACTED_INTERNAL }
+        : {
+            statusCode: HttpStatus.INTERNAL_SERVER_ERROR,
+            error: ErrorCode.INTERNAL_ERROR,
+            message: (exception as Error).message,
+          };
+    }
+
+    const supabase = this.tryResolveSupabaseError(exception);
+    if (supabase) return supabase;
+
+    const stellar = this.tryResolveStellarError(exception);
+    if (stellar) return stellar;
+
+    return this.resolveUnknownError(exception);
+  }
+
+  private resolveHttpException(exception: HttpException): ResolvedError {
+    const status = exception.getStatus();
+    const response = exception.getResponse();
+
+    const rawMessage: unknown =
+      typeof response === 'string'
+        ? response
+        : (response as Record<string, unknown>).message;
+
+    const message =
+      typeof rawMessage === 'string'
+        ? rawMessage
+        : Array.isArray(rawMessage)
+          ? rawMessage.join('; ')
+          : exception.message;
+
+    const rawErrors =
+      typeof response === 'object' && response !== null
+        ? (response as Record<string, unknown>).errors
+        : undefined;
+
+    const details: unknown[] | undefined =
+      Array.isArray(rawErrors) && rawErrors.length > 0 ? rawErrors : undefined;
+
+    const error = this.mapHttpStatusToErrorCode(status, details);
+
+    // In production, redact the message on 5xx HttpExceptions so that any
+    // inadvertently thrown InternalServerErrorException carrying a raw
+    // infrastructure message (e.g. from storage.service.ts) cannot leak.
+    if (this.isProd && status >= 500) {
+      return {
+        statusCode: status,
+        error,
+        message: REDACTED_INTERNAL.message,
+      };
+    }
+
+    return {
+      statusCode: status,
+      message,
+      error,
+      details,
+    };
+  }
+
+  private mapHttpStatusToErrorCode(
+    status: number,
+    details?: unknown[],
+  ): ErrorCode {
+    if (details) return ErrorCode.VALIDATION_ERROR;
+
+    switch (status) {
+      case 400:
+        return ErrorCode.BAD_REQUEST;
+      case 401:
+        return ErrorCode.UNAUTHORIZED;
+      case 403:
+        return ErrorCode.FORBIDDEN;
+      case 404:
+        return ErrorCode.NOT_FOUND;
+      case 409:
+        return ErrorCode.CONFLICT;
+      case 429:
+        return ErrorCode.RATE_LIMIT_EXCEEDED;
+      case 503:
+        return ErrorCode.SERVICE_UNAVAILABLE;
+      default:
+        return status >= 500 ? ErrorCode.INTERNAL_ERROR : ErrorCode.BAD_REQUEST;
+    }
+  }
+
+  /**
+   * Detects TypeORM QueryFailedError by duck-typing so we avoid a hard
+   * dependency on typeorm in this common module.
+   *
+   * QueryFailedError always has:
+   *   - name === 'QueryFailedError'
+   *   - string `query` property (the raw SQL)
+   *   - string `driverError` or `parameters` property
+   */
+  private isQueryFailedError(exception: unknown): boolean {
+    if (!(exception instanceof Error)) return false;
+    if (exception.constructor.name !== 'QueryFailedError') return false;
+    const e = exception as Record<string, unknown>;
+    return typeof e['query'] === 'string';
+  }
+
+  private tryResolveSupabaseError(exception: unknown): ResolvedError | null {
+    if (
+      typeof exception !== 'object' ||
+      exception === null ||
+      exception instanceof HttpException ||
+      exception instanceof Error === false
+    ) {
+      return null;
+    }
+
+    const err = exception as unknown as Record<string, unknown>;
+
+    // Supabase PostgrestError shape: { code, message, details, hint }
+    if (
+      typeof err.code === 'string' &&
+      typeof err.message === 'string' &&
+      typeof err.details === 'string'
+    ) {
+      // Always log the full error server-side (includes project ref, constraint, etc.).
+      this.logger.error('Supabase error', {
+        code: err.code,
+        message: err.message,
+        details: err.details,
+        hint: err.hint,
+        stack: (err as unknown as Error).stack,
+      });
+      Sentry.captureException(exception);
+
+      if (this.isProd) {
+        return { ...REDACTED_DEPENDENCY };
+      }
+
+      return {
+        statusCode: HttpStatus.BAD_GATEWAY,
+        message: err.message as string,
+        error: ErrorCode.SUPABASE_ERROR,
+        details: {
+          code: err.code,
+          hint: err.hint,
+        },
+      };
+    }
+
+    return null;
+  }
+
+  private tryResolveStellarError(exception: unknown): ResolvedError | null {
+    if (
+      typeof exception !== 'object' ||
+      exception === null ||
+      exception instanceof HttpException ||
+      exception instanceof Error === false
+    ) {
+      return null;
+    }
+
+    const err = exception as unknown as Record<string, unknown>;
+
+    if (err.response !== undefined && typeof err.response === 'object' && err.response !== null) {
+      const resp = err.response as Record<string, unknown>;
+
+      // Always log the full Stellar SDK error server-side.
+      this.logger.error('Stellar error', {
+        message: err.message,
+        responseData: resp.data,
+        responseStatus: resp.status,
+        stack: (err as unknown as Error).stack,
+      });
+      Sentry.captureException(exception);
+
+      if (this.isProd) {
+        return { ...REDACTED_DEPENDENCY };
+      }
+
+      const status =
+        typeof resp.status === 'number' ? resp.status : HttpStatus.BAD_GATEWAY;
+      const message =
+        typeof resp.data === 'object' && resp.data !== null
+          ? ((resp.data as Record<string, unknown>).detail as string) ??
+            ((resp.data as Record<string, unknown>).message as string) ??
+            (err.message as string) ??
+            'Stellar request failed'
+          : (err.message as string) ?? 'Stellar request failed';
+
+      return {
+        statusCode: status,
+        message: typeof message === 'string' ? message : 'Stellar request failed',
+        error: ErrorCode.STELLAR_ERROR,
+        details: { response: resp.data ?? resp },
+      };
+    }
+
+    return null;
+  }
+
+  private resolveUnknownError(exception: unknown): ResolvedError {
+    this.logger.error(
+      'Unhandled exception',
+      exception instanceof Error ? exception.stack : String(exception),
+    );
+    Sentry.captureException(exception);
+
+    return { ...REDACTED_INTERNAL };
+  }
+}

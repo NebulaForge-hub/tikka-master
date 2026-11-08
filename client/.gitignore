@@ -1,0 +1,10 @@
+# ... existing logs ...
+node_modules/
+dist/
+dist-ssr/
+*.local
+# ... rest of file ...
+
+# Lighthouse CI
+.lighthouseci/
+.env.lhci

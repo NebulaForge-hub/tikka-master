@@ -1,0 +1,207 @@
+import { OracleLoggerService } from '../../logger/oracle-logger';
+import { Injectable, Logger } from '@nestjs/common';
+import { KeyProvider, KeyProviderHealth } from '../key-provider.interface';
+import { KeyProviderError } from '../key-provider.error';
+
+/**
+ * AWS KMS KeyProvider.
+ *
+ * Uses AWS Key Management Service to perform signing operations.
+ * The private key never leaves the HSM, ensuring maximum security.
+ *
+ * Prerequisites:
+ * - AWS SDK installed: npm install @aws-sdk/client-kms
+ * - IAM permissions: kms:Sign, kms:GetPublicKey
+ * - KMS key must be configured for SIGN_VERIFY with ECC_SECG_P256K1 or similar
+ *
+ * Note: AWS KMS does not natively support Ed25519. This implementation
+ * requires a custom solution or using ECDSA as an alternative.
+ * For true Ed25519 support, consider using AWS CloudHSM or storing
+ * the public key separately and only using KMS for signing operations.
+ */
+@Injectable()
+export class AwsKmsKeyProvider implements KeyProvider {
+  private kmsClient: any;
+  private keyId: string;
+  private publicKey: Buffer | null = null;
+  private publicKeyString: string | null = null;
+
+  constructor(
+    private readonly logger: OracleLoggerService,
+    region: string,
+    keyId: string,
+  ) {
+    if (!region || !keyId) {
+      throw new KeyProviderError('AWS region and keyId are required for AwsKmsKeyProvider');
+    }
+
+    this.keyId = keyId;
+
+    try {
+      // Lazy load AWS SDK to avoid requiring it when not using AWS KMS
+      const { KMSClient } = require('@aws-sdk/client-kms');
+      this.kmsClient = new KMSClient({ region });
+      this.logger.log(`AwsKmsKeyProvider initialized for key: ${keyId}`);
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to initialize AWS KMS client: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new KeyProviderError(
+        'AWS SDK not installed. Run: npm install @aws-sdk/client-kms',
+        error,
+      );
+    }
+  }
+
+  async getPublicKey(): Promise<string> {
+    if (this.publicKeyString) {
+      return this.publicKeyString;
+    }
+
+    await this.loadPublicKey();
+    return this.publicKeyString!;
+  }
+
+  async getPublicKeyBuffer(): Promise<Buffer> {
+    if (this.publicKey) {
+      return this.publicKey;
+    }
+
+    await this.loadPublicKey();
+    return this.publicKey!;
+  }
+
+  private async loadPublicKey(): Promise<void> {
+    try {
+      const { GetPublicKeyCommand } = require('@aws-sdk/client-kms');
+      const command = new GetPublicKeyCommand({ KeyId: this.keyId });
+      const response = await this.kmsClient.send(command);
+
+      // Extract the public key from DER format
+      // Note: This is a simplified implementation. In production, you'll need
+      // to properly parse the DER-encoded public key based on your key type.
+      this.publicKey = Buffer.from(response.PublicKey);
+      this.publicKeyString = this.publicKey.toString('hex');
+
+      this.logger.log('Public key loaded from AWS KMS');
+    } catch (error: any) {
+      this.logger.error(
+        `Failed to load public key from AWS KMS: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new KeyProviderError('Failed to retrieve public key from AWS KMS', error);
+    }
+  }
+
+  async sign(data: Buffer): Promise<Buffer> {
+    try {
+      const { SignCommand, MessageType, SigningAlgorithmSpec } = require('@aws-sdk/client-kms');
+
+      const command = new SignCommand({
+        KeyId: this.keyId,
+        Message: data,
+        MessageType: MessageType.RAW,
+        // Note: AWS KMS doesn't support Ed25519 natively.
+        // You may need to use ECDSA_SHA_256 or configure CloudHSM for Ed25519.
+        // This is a placeholder - adjust based on your KMS key configuration.
+        SigningAlgorithm: SigningAlgorithmSpec.ECDSA_SHA_256,
+      });
+
+      const response = await this.kmsClient.send(command);
+      const signature = Buffer.from(response.Signature);
+
+      this.logger.debug(`Signed ${data.length} bytes using AWS KMS`);
+      return signature;
+    } catch (error: any) {
+      this.logger.error(
+        `AWS KMS signing failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      throw new KeyProviderError('Failed to sign data with AWS KMS', error);
+    }
+  }
+
+  getProviderType(): string {
+    return 'aws-kms';
+  }
+
+  /**
+   * Probes AWS KMS and returns a safe health snapshot.
+   *
+   * Calls `DescribeKey` (read-only, no key material returned) to verify
+   * connectivity and IAM permissions, then exposes only the key ARN.
+   *
+   * SECURITY: AWS KMS never returns private key material from DescribeKey.
+   *           Raw SDK error messages are sanitised before inclusion.
+   */
+  async getProviderHealth(): Promise<KeyProviderHealth> {
+    const checkedAt = new Date().toISOString();
+    // Use the cached public key string as the key identifier when available.
+    const cachedKeyId = this.publicKeyString
+      ? `arn-cached:${this.keyId}` // safer label when we already have the pubkey
+      : null;
+
+    try {
+      const { DescribeKeyCommand } = require('@aws-sdk/client-kms');
+      const command = new DescribeKeyCommand({ KeyId: this.keyId });
+      const response = await this.kmsClient.send(command);
+
+      const keyArn: string = response?.KeyMetadata?.Arn ?? this.keyId;
+
+      return {
+        status: 'healthy',
+        activeKeyId: keyArn,
+        message: 'AWS KMS provider is healthy. Key is accessible.',
+        checkedAt,
+        providerType: this.getProviderType(),
+      };
+    } catch (error: any) {
+      const status = this.classifyAwsError(error);
+      return {
+        status,
+        activeKeyId: cachedKeyId,
+        message: this.sanitiseAwsError(error, status),
+        checkedAt,
+        providerType: this.getProviderType(),
+      };
+    }
+  }
+
+  /** Maps AWS error codes to our status taxonomy without leaking raw messages. */
+  private classifyAwsError(error: any): 'unavailable' | 'permission_denied' | 'unknown' {
+    const code: string = error?.name ?? error?.code ?? '';
+    if (
+      code === 'AccessDeniedException' ||
+      code === 'InvalidClientTokenId' ||
+      code === 'AuthFailure' ||
+      code === 'UnrecognizedClientException'
+    ) {
+      return 'permission_denied';
+    }
+    if (
+      code === 'NetworkingError' ||
+      code === 'TimeoutError' ||
+      code === 'RequestTimeout' ||
+      code === 'EndpointResolutionError' ||
+      // Common transient AWS errors
+      error?.message?.includes('ECONNREFUSED') ||
+      error?.message?.includes('ETIMEDOUT')
+    ) {
+      return 'unavailable';
+    }
+    return 'unknown';
+  }
+
+  /** Returns a safe, sanitised description of an AWS error. */
+  private sanitiseAwsError(
+    error: any,
+    status: 'unavailable' | 'permission_denied' | 'unknown',
+  ): string {
+    switch (status) {
+      case 'permission_denied':
+        return 'AWS KMS returned an authentication or permission error. Check IAM policies and credentials.';
+      case 'unavailable':
+        return 'AWS KMS is unreachable. Check network connectivity and the configured region.';
+      default:
+        return 'An unexpected error occurred while contacting AWS KMS.';
+    }
+  }
+}

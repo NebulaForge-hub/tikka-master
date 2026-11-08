@@ -1,0 +1,331 @@
+import { RaffleParams } from '../ingestor/event.types';
+import { Injectable, Logger } from '@nestjs/common';
+import { DataSource, QueryRunner } from 'typeorm';
+import { CacheService } from '../cache/cache.service';
+import { UserProcessor } from './user.processor';
+import { RaffleEntity, RaffleStatus } from '../database/entities/raffle.entity';
+import { RaffleEventEntity } from '../database/entities/raffle-event.entity';
+import { WebhookService } from '../webhooks/webhook.service';
+import { CURRENT_SCHEMA_VERSION } from '../ingestor/handlers/schema-version';
+
+@Injectable()
+export class RaffleProcessor {
+  private readonly logger = new Logger(RaffleProcessor.name);
+
+  constructor(
+    private dataSource: DataSource,
+    private cacheService: CacheService,
+    private userProcessor: UserProcessor,
+    private webhookService: WebhookService,
+  ) {}
+
+  /**
+   * Called when a RaffleCreated event is indexed.
+   *
+   * Upserts the raffle row with all params and status OPEN.
+   * Idempotent: the insert uses orIgnore() keyed on raffle_id, so replaying
+   * the same event is a no-op. The raffle_events audit row is keyed on txHash.
+   */
+  async handleRaffleCreated(
+    raffleId: number,
+    creator: string,
+    ledger: number,
+    txHash: string,
+    params: RaffleParams,
+    schemaVersion: number = CURRENT_SCHEMA_VERSION,
+  ): Promise<QueryRunner> {
+    this.logger.log(`Handling RaffleCreated for raffle ${raffleId} (tx ${txHash})`);
+    const runner = this.dataSource.createQueryRunner();
+    await runner.connect();
+    await runner.startTransaction();
+
+    try {
+      // 1. Upsert raffle row — idempotent via orIgnore on PK
+      await runner.manager
+        .createQueryBuilder()
+        .insert()
+        .into(RaffleEntity)
+        .values({
+          id: raffleId,
+          creator,
+          status: RaffleStatus.OPEN,
+          ticketPrice: params.ticket_price,
+          asset: params.asset,
+          maxTickets: params.max_tickets,
+          endTime: params.end_time.toString(),
+          metadataCid: params.metadata_cid || null,
+          createdLedger: ledger,
+          winner: null,
+          winningTicketId: null,
+          prizeAmount: null,
+          finalizedLedger: null,
+        })
+        .orIgnore()
+        .execute();
+
+      // 2. Audit event — idempotent via unique constraint on txHash
+      await runner.manager
+        .createQueryBuilder()
+        .insert()
+        .into(RaffleEventEntity)
+        .values({
+          raffleId,
+          eventType: 'RaffleCreated',
+          schemaVersion,
+          ledger,
+          txHash,
+          payloadJson: { raffle_id: raffleId, creator, params },
+        })
+        .orIgnore()
+        .execute();
+
+      // 3. Ensure creator has a user row
+      await this.userProcessor.handleRaffleCreated(creator, ledger, runner);
+
+      await this.cacheService.invalidateActiveRaffles();
+      await this.cacheService.invalidatePlatformStats();
+
+      await this.webhookService.dispatch('RaffleCreated', {
+        raffleId,
+        creator,
+        ledger,
+        timestamp: new Date(),
+      });
+
+      return runner;
+    } catch (e) {
+      await runner.rollbackTransaction();
+      await runner.release();
+      this.logger.error(
+        `Error processing RaffleCreated for raffle ${raffleId} (tx ${txHash})`,
+        e instanceof Error ? e.stack : String(e),
+      );
+      throw e;
+    }
+  }
+
+  /**
+   * Called when a DrawTriggered event is indexed.
+   *
+   * Updates the raffle status OPEN → DRAWING.
+   * Idempotent: the raffle_events audit row is keyed on txHash; the raffle UPDATE
+   * is conditional on the row still being OPEN, so a replay is a no-op and a late
+   * DrawTriggered can never drag a FINALIZED/CANCELLED raffle backwards.
+   */
+  async handleDrawTriggered(
+    raffleId: number,
+    ledger: number,
+    txHash: string,
+    schemaVersion: number = CURRENT_SCHEMA_VERSION,
+  ): Promise<QueryRunner> {
+    this.logger.log(`Handling DrawTriggered for raffle ${raffleId} (tx ${txHash})`);
+    const runner = this.dataSource.createQueryRunner();
+    await runner.connect();
+    await runner.startTransaction();
+
+    try {
+      // 1. Update raffle row — conditional so replays and late events are no-ops
+      await runner.manager
+        .createQueryBuilder()
+        .update(RaffleEntity)
+        .set({
+          status: RaffleStatus.DRAWING,
+        })
+        .where('id = :raffleId AND status = :open', {
+          raffleId,
+          open: RaffleStatus.OPEN,
+        })
+        .execute();
+
+      // 2. Audit event — idempotent via unique constraint on txHash
+      await runner.manager
+        .createQueryBuilder()
+        .insert()
+        .into(RaffleEventEntity)
+        .values({
+          raffleId,
+          eventType: 'DrawTriggered',
+          schemaVersion,
+          ledger,
+          txHash,
+          payloadJson: { raffle_id: raffleId, ledger },
+        })
+        .orIgnore()
+        .execute();
+
+      await this.cacheService.invalidateRaffleDetail(raffleId.toString());
+      await this.cacheService.invalidateActiveRaffles();
+
+      return runner;
+    } catch (e) {
+      await runner.rollbackTransaction();
+      await runner.release();
+      this.logger.error(
+        `Error processing DrawTriggered for raffle ${raffleId} (tx ${txHash})`,
+        e instanceof Error ? e.stack : String(e),
+      );
+      throw e;
+    }
+  }
+
+  /**
+   * Called when a RaffleFinalized event is indexed.
+   *
+   * Updates the raffle row: winner, winning_ticket_id, prize_amount, status → FINALIZED.
+   * Idempotent: the raffle_events audit row is keyed on txHash; the raffle UPDATE is
+   * conditional on the row not already being FINALIZED.
+   */
+  async handleRaffleFinalized(
+    raffleId: number,
+    winner: string,
+    winningTicketId: number,
+    prizeAmount: string,
+    ledger: number,
+    txHash: string,
+    schemaVersion: number = CURRENT_SCHEMA_VERSION,
+  ): Promise<QueryRunner> {
+    this.logger.log(
+      `Handling RaffleFinalized for raffle ${raffleId}, winner ${winner} (tx ${txHash})`,
+    );
+    const runner = this.dataSource.createQueryRunner();
+    await runner.connect();
+    await runner.startTransaction();
+
+    try {
+      // 1. Update raffle row — conditional so replays are no-ops
+      await runner.manager
+        .createQueryBuilder()
+        .update(RaffleEntity)
+        .set({
+          status: RaffleStatus.FINALIZED,
+          winner,
+          winningTicketId,
+          prizeAmount,
+          finalizedLedger: ledger,
+        })
+        .where('id = :raffleId AND status != :finalized', {
+          raffleId,
+          finalized: RaffleStatus.FINALIZED,
+        })
+        .execute();
+
+      // 2. Audit event — idempotent via unique constraint on txHash
+      await runner.manager
+        .createQueryBuilder()
+        .insert()
+        .into(RaffleEventEntity)
+        .values({
+          raffleId,
+          eventType: 'RaffleFinalized',
+          schemaVersion,
+          ledger,
+          txHash,
+          payloadJson: {
+            raffle_id: raffleId,
+            winner,
+            winning_ticket_id: winningTicketId,
+            prize_amount: prizeAmount,
+          },
+        })
+        .orIgnore()
+        .execute();
+
+      // 3. Update winner stats
+      await this.userProcessor.handleRaffleFinalized(raffleId, winner, prizeAmount, runner);
+
+      await this.cacheService.invalidateRaffleDetail(raffleId.toString());
+      await this.cacheService.invalidateLeaderboard();
+      await this.cacheService.invalidatePlatformStats();
+
+      await this.webhookService.dispatch('RaffleFinalized', {
+        raffleId,
+        winner,
+        winningTicketId,
+        prizeAmount,
+        timestamp: new Date(),
+      });
+
+      return runner;
+    } catch (e) {
+      await runner.rollbackTransaction();
+      await runner.release();
+      this.logger.error(
+        `Error processing RaffleFinalized for raffle ${raffleId} (tx ${txHash})`,
+        e instanceof Error ? e.stack : String(e),
+      );
+      throw e;
+    }
+  }
+
+  /**
+   * Called when a RaffleCancelled event is indexed.
+   *
+   * Updates raffle status to CANCELLED.
+   * Idempotent: the raffle_events audit row is keyed on txHash; the raffle UPDATE
+   * is conditional on the row not already being CANCELLED.
+   */
+  async handleRaffleCancelled(
+    raffleId: number,
+    reason: string,
+    ledger: number,
+    txHash: string,
+    schemaVersion: number = CURRENT_SCHEMA_VERSION,
+  ): Promise<QueryRunner> {
+    this.logger.log(`Handling RaffleCancelled for raffle ${raffleId} (tx ${txHash})`);
+    const runner = this.dataSource.createQueryRunner();
+    await runner.connect();
+    await runner.startTransaction();
+
+    try {
+      // 1. Update raffle row — conditional so replays are no-ops
+      await runner.manager
+        .createQueryBuilder()
+        .update(RaffleEntity)
+        .set({
+          status: RaffleStatus.CANCELLED,
+          finalizedLedger: ledger,
+        })
+        .where('id = :raffleId AND status != :cancelled', {
+          raffleId,
+          cancelled: RaffleStatus.CANCELLED,
+        })
+        .execute();
+
+      // 2. Audit event — idempotent via unique constraint on txHash
+      await runner.manager
+        .createQueryBuilder()
+        .insert()
+        .into(RaffleEventEntity)
+        .values({
+          raffleId,
+          eventType: 'RaffleCancelled',
+          schemaVersion,
+          ledger,
+          txHash,
+          payloadJson: { raffle_id: raffleId, reason },
+        })
+        .orIgnore()
+        .execute();
+
+      await this.cacheService.invalidateRaffleDetail(raffleId.toString());
+      await this.cacheService.invalidateActiveRaffles();
+
+      await this.webhookService.dispatch('RaffleCancelled', {
+        raffleId,
+        reason,
+        ledger,
+        timestamp: new Date(),
+      });
+
+      return runner;
+    } catch (e) {
+      await runner.rollbackTransaction();
+      await runner.release();
+      this.logger.error(
+        `Error processing RaffleCancelled for raffle ${raffleId} (tx ${txHash})`,
+        e instanceof Error ? e.stack : String(e),
+      );
+      throw e;
+    }
+  }
+}

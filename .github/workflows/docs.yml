@@ -1,0 +1,43 @@
+name: Deploy SDK Docs
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+
+jobs:
+  deploy:
+    name: Build and deploy TypeDoc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: sdk/package.json
+
+      - name: Install SDK dependencies
+        working-directory: sdk
+        run: npm install --ignore-scripts
+
+      - name: Generate docs
+        working-directory: sdk
+        run: npm run docs
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: gh-pages
+          publish_dir: sdk/docs
+          enable_jekyll: false
+          force_orphan: true

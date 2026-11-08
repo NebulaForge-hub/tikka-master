@@ -1,0 +1,100 @@
+import React from "react";
+import { useTranslation } from "react-i18next";
+import type { StepComponentProps } from "../../types/forms";
+
+const DetailsStep: React.FC<StepComponentProps> = ({
+    formData,
+    updateFormData,
+    onNext,
+    onBack,
+}) => {
+    const { t } = useTranslation("create");
+
+    const handleTitleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+        updateFormData({ title: e.target.value });
+    };
+
+    const handleDescriptionChange = (
+        e: React.ChangeEvent<HTMLTextAreaElement>
+    ) => {
+        updateFormData({ description: e.target.value });
+    };
+
+    const canContinue =
+        formData.title.trim() !== "" && formData.description.trim() !== "";
+
+    return (
+        <div className="bg-white dark:bg-[#1E1932] rounded-xl p-6">
+            <div className="flex items-center space-x-3 mb-2">
+                <svg
+                    className="w-6 h-6 text-gray-900 dark:text-white"
+                    fill="currentColor"
+                    viewBox="0 0 20 20"
+                >
+                    <path
+                        fillRule="evenodd"
+                        d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z"
+                        clipRule="evenodd"
+                    />
+                </svg>
+                <h3 className="text-gray-900 dark:text-white text-xl font-bold">{t("details.heading")}</h3>
+            </div>
+            <p className="text-gray-700 dark:text-gray-300 text-sm mb-6">
+                {t("details.subtitle")}
+            </p>
+
+            <div className="space-y-6">
+                {/* Title Input */}
+                <div>
+                    <label className="block text-gray-900 dark:text-white text-sm font-medium mb-2">
+                        {t("details.titleLabel")}
+                    </label>
+                    <input
+                        type="text"
+                        value={formData.title}
+                        onChange={handleTitleChange}
+                        placeholder={t("details.titlePlaceholder")}
+                        className="w-full px-4 py-3 bg-gray-200 dark:bg-[#2A264A] border border-gray-600 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#FF389C] focus:border-transparent"
+                    />
+                </div>
+
+                {/* Description Input */}
+                <div>
+                    <label className="block text-gray-900 dark:text-white text-sm font-medium mb-2">
+                        {t("details.descriptionLabel")}
+                    </label>
+                    <textarea
+                        value={formData.description}
+                        onChange={handleDescriptionChange}
+                        placeholder={t("details.descriptionPlaceholder")}
+                        rows={4}
+                        className="w-full px-4 py-3 bg-gray-200 dark:bg-[#2A264A] border border-gray-600 rounded-lg text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-[#FF389C] focus:border-transparent resize-none"
+                    />
+                </div>
+            </div>
+
+            {/* Navigation Buttons */}
+            <div className="flex justify-between mt-8 gap-4">
+                <button
+                    onClick={onBack}
+                    className="px-6 py-3 bg-gray-200 dark:bg-[#2A264A] text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-[#3A365A] transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-[#FF389C] focus:ring-offset-2 dark:focus:ring-offset-[#0B1220]"
+                >
+                    {t("nav.back")}
+                </button>
+                <button
+                    onClick={onNext}
+                    disabled={!canContinue}
+                    className={`px-6 py-3 rounded-lg font-medium transition-colors duration-200 focus:outline-none focus:ring-2 focus:ring-offset-2 dark:focus:ring-offset-[#0B1220] ${
+                        canContinue
+                            ? "bg-[#FF389C] hover:bg-[#FF389C]/90 text-gray-900 dark:text-white focus:ring-[#FF389C]"
+                            : "bg-gray-300 dark:bg-gray-600 text-gray-400 cursor-not-allowed"
+                    }`}
+                >
+                    {t("nav.continue")}
+                </button>
+            </div>
+        </div>
+    );
+};
+
+export default DetailsStep;

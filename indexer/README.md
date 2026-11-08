@@ -1,0 +1,451 @@
+# tikka-indexer
+
+Blockchain event ingestion & query layer for the Tikka raffle platform.  
+Subscribes to Stellar ledger events, decodes Tikka contract events, and writes structured data to PostgreSQL.
+
+---
+
+## Database Setup
+
+### Prerequisites
+
+| Requirement       | Version            |
+| ----------------- | ------------------ |
+| Node.js           | ≥ 20               |
+| PostgreSQL        | ≥ 15               |
+| (Optional) Docker | for local Postgres |
+
+### Environment Variables
+
+See the [central indexer environment reference](../docs/env/indexer.md) for every
+variable read by startup configuration and runtime modules.
+
+Start from the checked-in example, then fill in the required RPC, contract, and
+database settings:
+
+```bash
+cp .env.example .env.local
+```
+
+## Slow query observability
+
+The indexer exports two database metrics for query performance:
+
+- `tikka_db_query_duration_seconds` — histogram of all query durations
+- `tikka_db_slow_query_total` — counter of slow queries by query hash
+
+Slow queries are logged at WARN level with a stable SHA-256 hash of the normalized query template. Raw SQL text is not emitted by the logger.
+
+To correlate the query hash with PostgreSQL SQL text, enable `pg_stat_statements` and compute the same normalized SHA-256 hash:
+
+```sql
+SELECT
+  encode(digest(regexp_replace(query, '\s+', ' ', 'g'), 'sha256'), 'hex') AS query_hash,
+  query,
+  calls,
+  total_time,
+  mean_time
+FROM pg_stat_statements
+WHERE query ILIKE '%your_fragment%'
+ORDER BY total_time DESC
+LIMIT 20;
+```
+
+Replace `your_fragment` with a portion of the suspected slow query. The `query_hash` label in Prometheus should match the computed hash above.
+
+### Local Postgres with Docker
+
+```bash
+docker run -d \
+  --name tikka-pg \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=tikka_indexer \
+  -p 5432:5432 \
+  postgres:16-alpine
+```
+
+---
+
+## Running the Indexer
+
+```bash
+# Install dependencies
+npm install
+
+# Development (with hot-reload)
+npm run start:dev
+
+# Production
+npm run build
+npm start
+```
+
+> **Migrations run automatically** when the app bootstraps — no manual step needed.  
+> TypeORM's `migrationsRun: true` applies all pending migrations before the server starts listening.
+
+---
+
+## CLI Commands
+
+### Status Command
+
+You can view the real-time status of the indexer, including lag, DLQ size, cache state, and last processed event using the CLI status command.
+
+```bash
+# View status as a human-readable table
+pnpm run status
+
+# View status as JSON (useful for scripts)
+pnpm run status -- --json
+```
+
+**Output example:**
+```
+Tikka Indexer Status  2023-10-27T10:00:00.000Z
+──────────────────────────────────────────────────
+Ledger
+  Current (indexed)          1000
+  Horizon (latest)           1005
+  Lag                        5 ledgers
+
+Events
+  Total processed            500
+  Last 24 h                  10
+  Last processed at          2023-10-27T09:55:00.000Z
+
+DLQ
+  Total size                 0
+
+Cache
+  Status                     ok
+  Latency                    2 ms
+
+Database
+  Status                     ok
+  Pool (total / idle / wait) 10 / 10 / 0
+──────────────────────────────────────────────────
+```
+
+---
+
+## Migrations
+
+### Run pending migrations manually
+
+```bash
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/tikka_indexer
+npm run migration:run
+```
+
+### Revert the last migration
+
+```bash
+npm run migration:revert
+```
+
+### Generate a new migration after changing an entity
+
+```bash
+npm run migration:generate -- src/database/migrations/YourMigrationName
+```
+
+---
+
+## Data Model
+
+| Table            | Description                                      |
+| ---------------- | ------------------------------------------------ |
+| `raffles`        | One row per on-chain raffle                      |
+| `tickets`        | One row per purchased ticket                     |
+| `users`          | Aggregated per-address participation stats       |
+| `raffle_events`  | Append-only log of decoded contract events       |
+| `platform_stats` | Daily aggregate roll-ups                         |
+| `indexer_cursor` | Singleton row tracking the last processed ledger |
+
+Full schema specification: [`docs/ARCHITECTURE.md`](../docs/ARCHITECTURE.md) § Data Model.
+
+### Entity Ownership & Field Documentation
+
+Each entity includes raw chain state (source-of-truth from Stellar ledger) and derived query state (computed aggregates). Contributors need to understand which fields are safe to recalculate and which are immutable.
+
+**📖 [Entity Ownership Documentation](../docs/database/ENTITY_OWNERSHIP.md)**
+
+This document describes:
+- Field ownership (raw chain state vs derived)
+- Updater handlers for each entity
+- Which fields are safe to recalculate
+- Idempotency keys and replay protection
+- Migration ownership rules
+
+All entity files include inline comments marking derived fields and their updater handlers.
+
+---
+
+## Redis Cache TTL Strategy
+
+See [`docs/CACHE.md`](./docs/CACHE.md) for every cache key family: TTL, event-driven invalidation triggers, and staleness tolerance.
+
+Caching logic is wired into the processors in `src/processors/` to ensure consistency after database writes.
+
+---
+
+## Redis Memory Management and Monitoring
+
+- Config file: `indexer/redis.conf`
+- `maxmemory 4gb`, `maxmemory-policy allkeys-lru`, `maxmemory-samples 5`.
+- Eviction policy: `allkeys-lru`, to keep frequently-accessed data and evict least recently used keys across all key namespaces.
+- TTLs are still used in CacheService for key lifecycle control.
+
+### Monitoring
+
+CacheService periodically calls Redis `INFO memory` and logs:
+
+- WARNING when usage >= 80%
+- CRITICAL when usage >= 90%
+
+Data monitored:
+
+- `used_memory`
+- `maxmemory`
+- `memory usage percentage`
+
+### Cache hit/miss tracking
+
+`CacheService` tracks per bucket:
+
+- `raffles`, `users`, `stats`, `others`
+- `hits`, `misses`, `requests`
+- `hit rate` (percent) via `getAllCacheHitRates()`
+
+Use this data to detect hot sets and to tune TTLs per data type.
+
+### Best practice
+
+1. Set `maxmemory` to ~50% of host RAM for dedicated cache nodes.
+2. Use `allkeys-lru` for general purpose cache with mixed TTL keys.
+3. Enable Redis slowlog & keyspace notifications for degraded performance debugging.
+4. Scale horizontally with Redis Cluster if items exceed node limit.
+
+---
+
+## Health Endpoint
+
+`GET /health` is intended for orchestration and monitoring. It reports indexer lag, DB connectivity, and Redis connectivity.
+
+### Response shape
+
+| Field              | Type                                    | Description                                                                                                                                      |
+| ------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `status`           | `'ok' \| 'degraded'`                    | `ok` when DB and Redis are up and lag is within threshold; `degraded` otherwise.                                                                 |
+| `lag_ledgers`      | `number \| null`                        | Current ledger (from Horizon) minus last processed ledger (cursor). `null` if Horizon is unreachable or cursor not yet set.                      |
+| `lagStatus`        | `'healthy' \| 'degraded' \| 'critical'` | Lag status based on alert thresholds. `healthy` ≤ alert threshold, `degraded` > LAG_THRESHOLD, `critical` > INDEXER_LAG_ALERT_THRESHOLD_LEDGERS. |
+| `db`               | `'ok' \| 'error'`                       | PostgreSQL connectivity.                                                                                                                         |
+| `redis`            | `'ok' \| 'error'`                       | Redis connectivity (ping).                                                                                                                       |
+| `redis_latency_ms` | `number \| null`                        | Redis ping latency in milliseconds.                                                                                                              |
+| `dlq_size`         | `number`                                | Number of events in the dead-letter queue.                                                                                                       |
+
+- **HTTP 200**: `status === 'ok'`.
+- **HTTP 503**: `status === 'degraded'` (e.g. lag &gt; `LAG_THRESHOLD`, or DB/Redis down).
+
+Example (200):
+
+```json
+{
+  "status": "ok",
+  "lag_ledgers": 12,
+  "lagStatus": "healthy",
+  "db": "ok",
+  "redis": "ok",
+  "redis_latency_ms": 5,
+  "dlq_size": 0
+}
+```
+
+Example (503, degraded by lag):
+
+```json
+{
+  "status": "degraded",
+  "lag_ledgers": 150,
+  "lagStatus": "critical",
+  "db": "ok",
+  "redis": "ok",
+  "redis_latency_ms": 8,
+  "dlq_size": 0
+}
+```
+
+### Lag Alerts and Event Emission
+
+The indexer emits `indexer_lag_alert` events when the lag status crosses into critical territory. This allows external services (like PushNotificationService in the backend) to receive real-time notifications.
+
+**Event payload:**
+
+```json
+{
+  "lag_ledgers": 75,
+  "threshold": 50,
+  "timestamp": "2024-01-01T12:00:00.000Z"
+}
+```
+
+**To listen for lag alerts:**
+
+```typescript
+// In your service constructor
+constructor(private healthService: HealthService) {
+  healthService.getEventEmitter().on('indexer_lag_alert', (alert) => {
+    console.log('Critical lag detected:', alert);
+    // Send notification, trigger alert, etc.
+  });
+}
+```
+
+### Alerting recommendations
+
+- **Alert if `lag_ledgers` &gt; 100** (or your chosen threshold): indexer is falling behind; investigate ingestion pipeline or Horizon availability.
+- **Alert if `lagStatus` === `'critical'`**: indexer is severely lagging; investigate ingestion pipeline or Horizon availability.
+- **Alert if `db` === `'error'`**: database unreachable; check Postgres and network.
+- **Alert if `redis` === `'error'`**: cache unreachable; optional for correctness but affects performance.
+- Use HTTP 503 as a readiness probe failure in Kubernetes/orchestration so the instance is not sent traffic when degraded.
+
+### Kubernetes Liveness Probe
+
+The indexer splits its probes so that lag never restarts a pod: liveness hits
+`/health/live`, which stays 200 while the process can serve HTTP, and readiness
+hits `/health/ready`, which returns 503 when `lagStatus === 'critical'` so traffic
+is withdrawn instead. The probe configuration lives in `k8s/kustomization.yaml`;
+see [`docs/k8s-deployment.md`](../docs/k8s-deployment.md) for the full table.
+
+---
+
+## Project Structure
+
+```
+src/
+├── app.module.ts               # Root NestJS module
+├── main.ts                     # Bootstrap entry point
+├── data-source.ts              # TypeORM CLI DataSource (migration scripts)
+├── config/
+│   └── database.config.ts      # TypeORM config factory
+├── cache/
+│   ├── cache.module.ts
+│   └── cache.service.ts        # Redis TTL strategies per data type
+├── health/
+│   ├── health.controller.ts   # GET /health
+│   ├── health.module.ts
+│   └── health.service.ts      # DB, Redis, Horizon lag checks
+├── ingestor/
+│   ├── cursor-manager.service.ts
+│   └── ingestor.module.ts
+├── api/
+│   ├── api.module.ts            # Internal HTTP API
+│   └── controllers/
+│       ├── raffles.controller.ts
+│       ├── users.controller.ts
+│       ├── leaderboard.controller.ts
+│       └── stats.controller.ts
+├── processors/
+│   ├── processors.module.ts
+│   ├── raffle.processor.ts
+│   └── user.processor.ts
+├── maintenance/
+│   ├── archive-raffle-events.ts        # Archiving CLI entry point
+│   ├── archive-raffle-events.spec.ts   # Entry-point contract test
+│   ├── archive/                        # Archiver modules (one per concern)
+│   │   ├── runner.ts                   # archiveOldRaffleEvents orchestration
+│   │   ├── checkpoint.service.ts       # archive_checkpoints lifecycle
+│   │   ├── integrity.ts                # Checkpoint hashing + verification
+│   │   ├── batch-selector.ts           # Cursor-based selection + deletion
+│   │   ├── writer.ts                   # CSV output
+│   │   ├── confirmation.ts             # CONFIRM_DELETE gate
+│   │   ├── cli.ts                      # Env parsing + process wiring
+│   │   ├── logging.ts                  # Structured JSON logs/alerts
+│   │   └── types.ts                    # Options, results, defaults
+│   ├── ARCHIVE_RAFFLE_EVENTS_GUIDE.md  # Comprehensive guide
+│   └── ARCHIVE_QUICK_REF.md            # Quick reference
+└── database/
+    ├── database.module.ts       # TypeOrmModule wiring
+    ├── entities/
+    │   ├── raffle.entity.ts
+    │   ├── ticket.entity.ts
+    │   ├── user.entity.ts
+    │   ├── raffle-event.entity.ts
+    │   ├── platform-stat.entity.ts
+    │   ├── indexer-cursor.entity.ts
+    │   └── archive-checkpoint.entity.ts  # Archiving checkpoint tracking
+    └── migrations/
+        ├── 1700000000000-CreateRaffles.ts
+        ├── 1700000000001-CreateTickets.ts
+        ├── 1700000000002-CreateUsers.ts
+        ├── 1700000000003-CreateRaffleEvents.ts
+        ├── 1700000000004-CreatePlatformStats.ts
+        ├── 1700000000005-CreateIndexerCursor.ts
+        └── 1748589373000-CreateArchiveCheckpoints.ts
+```
+
+---
+
+## Maintenance: Archiving Old Events
+
+The indexer includes a robust archiving utility for managing `raffle_events` table growth. The archiver exports old events to CSV and safely removes them from the database with built-in resumption support.
+
+### Quick Start
+
+```bash
+# Test archiving (dry-run, no changes)
+npm run archive:raffle-events
+
+# Production archiving (interactive — type "yes" when prompted)
+DRY_RUN=false npm run archive:raffle-events
+
+# Production / cron (explicit confirmation required)
+CONFIRM_DELETE=yes DRY_RUN=false npm run archive:raffle-events
+
+# Archive events older than 90 days
+RAFFLE_EVENTS_RETENTION_DAYS=90 CONFIRM_DELETE=yes DRY_RUN=false npm run archive:raffle-events
+```
+
+### Key Features
+
+✅ **Resumable Checkpointing** - Automatically resumes after interruptions  
+✅ **Dry-Run Mode** - Test without modifying database  
+✅ **Delete Confirmation** - TTY prompt or `CONFIRM_DELETE=yes` before deletes  
+✅ **Batch Limits** - Control processing with `MAX_BATCH` parameter  
+✅ **Transactional Safety** - Atomic checkpoint updates with deletions  
+✅ **Structured Logging** - JSON-formatted progress tracking  
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RAFFLE_EVENTS_RETENTION_DAYS` | `30` | Archive events older than N days |
+| `BATCH_SIZE` | `500` | Records per batch |
+| `MAX_BATCH` | unlimited | Maximum batches per run |
+| `DRY_RUN` | `true` | Simulate without changes |
+| `CONFIRM_DELETE` | unset | Required `yes` for non-interactive deletes |
+| `RESUME` | `true` | Resume from checkpoint |
+
+### Output
+
+Archives are written to `./archives/` directory:
+```
+raffle_events_2026-05-30_batch0001.csv
+raffle_events_2026-05-30_batch0002.csv
+```
+
+### Documentation
+
+- 🚨 [Archiving runbook](../docs/runbooks/archive-raffle-events.md) - Running it in production, resuming, integrity failures
+- 📜 [Retention policy & restore](../docs/database/raffle-events-retention.md) - Criteria, cadence, destination, restore
+- 📖 [Comprehensive Guide](./src/maintenance/ARCHIVE_RAFFLE_EVENTS_GUIDE.md) - Full documentation
+- 📋 [Quick Reference](./src/maintenance/ARCHIVE_QUICK_REF.md) - Common commands
+- 🔧 [Implementation Summary](../docs/archive/2026-08-28-indexer-ARCHIVE_IMPLEMENTATION_SUMMARY.md) - Technical details
+
+---
+
+## Resource Guidelines
+
+- **CPU**: 200m requests, 1000m limits
+- **Memory**: 512Mi requests, 1Gi limits
+  Indexer is optimized for single-replica execution.

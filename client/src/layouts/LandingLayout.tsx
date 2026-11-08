@@ -1,0 +1,34 @@
+import { logger } from '../utils/logger';
+import { useState } from "react";
+import Footer from "../components/landing/Footer";
+import Modal from "../components/modals/Modal";
+import Register from "../components/modals/Register";
+import Navbar from "../components/Navbar";
+import ErrorBoundary from "../components/ui/ErrorBoundary";
+import { Outlet } from "react-router-dom";
+
+const LandingLayout = () => {
+    const [modalOpen, setModalOpen] = useState(false);
+    const [activeTab, setActiveTab] = useState("Sign Up");
+    const changeModal = () => {
+        logger.log("clicked");
+        setModalOpen(true);
+    };
+    return (
+        <div className="bg-gray-50 dark:bg-[#060C23] text-gray-900 dark:text-white flex flex-col space-y-16 min-h-screen transition-colors duration-300">
+            <Navbar onStart={changeModal} />
+            <ErrorBoundary>
+                <Outlet />
+            </ErrorBoundary>
+            <Footer />
+            <Modal open={modalOpen} onClose={() => setModalOpen(false)}>
+                <Register
+                    activeTab={activeTab}
+                    changeActiveTab={setActiveTab}
+                />
+            </Modal>
+        </div>
+    );
+};
+
+export default LandingLayout;

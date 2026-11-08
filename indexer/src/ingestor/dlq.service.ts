@@ -1,0 +1,331 @@
+import { Injectable, Logger, OnModuleInit, Optional } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Between, FindOptionsWhere, IsNull, Repository } from 'typeorm';
+import { DeadLetterEventEntity, DlqReason } from '../database/entities/dead-letter-event.entity';
+import { DomainEvent } from './event.types';
+import { IngestionDispatcherService } from './ingestion-dispatcher.service';
+import { PipelineStateMachine, PipelineTransition } from './pipeline-state';
+import { MetricsService } from '../metrics/metrics.service';
+
+export { DlqReason };
+
+/**
+ * Reads the contract address off a raw DLQ event payload without `any`.
+ * Raw events are untyped at this boundary (they may be re-hydrated JSON).
+ */
+function readContractId(rawEvent: unknown): string | null {
+  const record =
+    rawEvent !== null && typeof rawEvent === 'object' ? (rawEvent as Record<string, unknown>) : {};
+  const id = record.contractId ?? record.contract_id;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/**
+ * The shape passed by IngestionDispatcherService when an event fails.
+ * Includes rich context for triage: handler name, schema version, timing, and
+ * the original raw payload for later replay.
+ */
+export interface DeadLetterEvent {
+  handlerName: string;
+  eventId: string;
+  eventType: string;
+  ledger: number | null;
+  txHash: string | null;
+  /** Schema version of the failed event, for forward-compatible triage. */
+  schemaVersion: number;
+  /** Why the event failed (parser/handler/db/schema) — drives replay policy. */
+  reason: DlqReason;
+  errorMessage: string;
+  errorStack?: string;
+  durationMs: number;
+  attemptCount: number;
+  event: DomainEvent;
+  rawEvent: unknown;
+  failedAt: string;
+}
+
+export const MAX_RETRIES = 5;
+
+/** Base delay in ms for exponential back-off: delay = BASE_DELAY_MS * 2^retryCount */
+const BASE_DELAY_MS = 1_000;
+
+/**
+ * Map from DlqReason to whether automatic replay should be attempted.
+ *
+ * - PARSE_ERROR / SCHEMA_UNSUPPORTED → not retryable (a code fix is needed first).
+ * - HANDLER_ERROR → retryable (handler may be idempotent or the error transient).
+ * - DB_TRANSIENT → retryable (connection issues are usually self-healing).
+ */
+const REASON_RETRYABLE: Record<DlqReason, boolean> = {
+  [DlqReason.PARSE_ERROR]: false,
+  [DlqReason.HANDLER_ERROR]: true,
+  [DlqReason.DB_TRANSIENT]: true,
+  [DlqReason.SCHEMA_UNSUPPORTED]: false,
+};
+
+export interface ReplayOptions {
+  /** When true, no writes are made — the command logs what would happen. */
+  dryRun?: boolean;
+  /** Only replay entries where `ledger` is >= fromLedger. */
+  fromLedger?: number;
+  /** Only replay entries where `ledger` is <= toLedger. */
+  toLedger?: number;
+  /**
+   * When true, entries that have already been replayed (`replayedAt != null`)
+   * are eligible again. Use with caution.
+   */
+  forceReplay?: boolean;
+}
+
+export interface ReplayResult {
+  replayed: number;
+  skipped: number;
+  failed: number;
+  dryRun: boolean;
+}
+
+@Injectable()
+export class DlqService implements OnModuleInit {
+  private readonly logger = new Logger(DlqService.name);
+
+  constructor(
+    @InjectRepository(DeadLetterEventEntity)
+    private readonly repo: Repository<DeadLetterEventEntity>,
+    private readonly dispatcher: IngestionDispatcherService,
+    @Optional() private readonly pipeline?: PipelineStateMachine,
+    @Optional() private readonly metrics?: MetricsService,
+  ) {}
+
+  async onModuleInit(): Promise<void> {
+    await this.refreshDlqSnapshotMetrics();
+  }
+
+  private async refreshDlqSnapshotMetrics(): Promise<void> {
+    if (!this.metrics) return;
+
+    try {
+      const where = { replayedAt: IsNull() };
+      const [depth, oldestEvent] = await Promise.all([
+        this.repo.count({ where }),
+        this.repo.findOne({
+          where,
+          select: { createdAt: true },
+          order: { createdAt: 'ASC' },
+        }),
+      ]);
+
+      this.metrics.setDlqUnreplayedEvents(depth);
+      this.metrics.setDlqOldestUnreplayedEventTimestampSeconds(
+        oldestEvent ? oldestEvent.createdAt.getTime() / 1_000 : 0,
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Failed to refresh DLQ snapshot metrics: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Enqueue a failed event in the DLQ with a classified reason and retryability flag.
+   *
+   * @param event     The domain event that failed.
+   * @param rawEvent  The raw ledger payload (preserved for replay context).
+   * @param error     The error that caused the failure.
+   * @param reason    Why the event failed. Defaults to HANDLER_ERROR.
+   */
+  async insert(
+    event: DomainEvent,
+    rawEvent: Record<string, unknown>,
+    error: unknown,
+    reason: DlqReason = DlqReason.HANDLER_ERROR,
+  ): Promise<void> {
+    const ledger = Number(rawEvent['ledger'] ?? 0);
+    const contractId = (rawEvent['contractId'] as string | undefined) ?? null;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const retryable = REASON_RETRYABLE[reason];
+
+    await this.repo.save(
+      this.repo.create({
+        ledger,
+        contractId,
+        eventType: event.type,
+        rawPayload: rawEvent,
+        errorMessage,
+        reason,
+        retryable,
+        retryCount: 0,
+        replayedAt: null,
+      }),
+    );
+
+    this.pipeline?.apply(PipelineTransition.DLQ_ENQUEUED);
+
+    // DLQ depth and total event metrics
+    const contractAddressLabel = contractId ?? 'unknown';
+    this.metrics?.incrementDlqEventsTotal(reason, event.type);
+    this.metrics?.setDlqDepth(
+      contractAddressLabel,
+      (await this.repo.count({
+        where: { contractId: contractAddressLabel, replayedAt: IsNull() },
+      })) as unknown as number,
+    );
+    await this.refreshDlqSnapshotMetrics();
+
+    this.logger.warn(
+      `DLQ [${reason}] stored ${event.type} at ledger ${ledger} (retryable=${retryable}): ${errorMessage}`,
+    );
+  }
+
+  /**
+   * Adapter called by IngestionDispatcherService with the rich DeadLetterEvent
+   * shape. Persists to the database so every failed event is durable and
+   * visible to the HTTP API, CLI, and metrics — all reading the same table.
+   */
+  async enqueue(record: DeadLetterEvent): Promise<void> {
+    const raw =
+      record.rawEvent !== null && typeof record.rawEvent === 'object'
+        ? (record.rawEvent as Record<string, unknown>)
+        : {};
+    const contractId = readContractId(record.rawEvent);
+    const retryable = REASON_RETRYABLE[record.reason];
+
+    await this.repo.save(
+      this.repo.create({
+        ledger: record.ledger ?? 0,
+        contractId,
+        eventType: record.eventType,
+        rawPayload: raw,
+        errorMessage: record.errorMessage,
+        reason: record.reason,
+        retryable,
+        retryCount: 0,
+        attemptCount: record.attemptCount,
+        replayedAt: null,
+      }),
+    );
+
+    this.pipeline?.apply(PipelineTransition.DLQ_ENQUEUED);
+
+    const contractAddressLabel = contractId ?? 'unknown';
+    this.metrics?.incrementDlqEventsTotal(record.reason, record.eventType);
+    this.metrics?.setDlqDepth(
+      contractAddressLabel,
+      (await this.repo.count({
+        where: { contractId: contractAddressLabel, replayedAt: IsNull() },
+      })) as unknown as number,
+    );
+    await this.refreshDlqSnapshotMetrics();
+
+    this.logger.error(
+      `DLQ [${record.reason}] handler=${record.handlerName} eventId=${record.eventId} durationMs=${record.durationMs} error=${record.errorMessage}`,
+      record.errorStack,
+    );
+  }
+
+  async count(): Promise<number> {
+    return this.repo.count({ where: { replayedAt: IsNull() } });
+  }
+
+  /**
+   * Replay all eligible DLQ entries, optionally scoped to a ledger range.
+   *
+   * Eligibility rules (applied in order):
+   * 1. `retryable` must be `true` (PARSE_ERROR and SCHEMA_UNSUPPORTED are excluded).
+   * 2. `retryCount` must be < MAX_RETRIES.
+   * 3. `replayedAt` must be null unless `forceReplay` is set.
+   * 4. If `fromLedger` / `toLedger` are provided, `ledger` must be within range.
+   *
+   * Idempotency: successful replays set `replayedAt` to the current timestamp.
+   * Subsequent calls will skip those entries unless `forceReplay` is passed.
+   *
+   * Dry-run: when `dryRun` is true the method logs each eligible entry and
+   * returns counts, but makes no state changes.
+   */
+  async replayAll(options: ReplayOptions = {}): Promise<ReplayResult> {
+    const { dryRun = false, fromLedger, toLedger, forceReplay = false } = options;
+
+    const where: FindOptionsWhere<DeadLetterEventEntity> = {
+      retryable: true,
+      ...(forceReplay ? {} : { replayedAt: IsNull() }),
+      ...(fromLedger !== undefined && toLedger !== undefined
+        ? { ledger: Between(fromLedger, toLedger) }
+        : fromLedger !== undefined
+          ? { ledger: Between(fromLedger, Number.MAX_SAFE_INTEGER) }
+          : toLedger !== undefined
+            ? { ledger: Between(0, toLedger) }
+            : {}),
+    };
+
+    const entries = await this.repo.find({ where, order: { ledger: 'ASC', createdAt: 'ASC' } });
+    const eligible = entries.filter((entry) => entry.retryCount < MAX_RETRIES);
+
+    let replayed = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const entry of eligible) {
+      if (dryRun) {
+        this.logger.log(
+          `DLQ dry-run: would replay ${entry.eventType} ledger=${entry.ledger} id=${entry.id} (reason=${entry.reason} retries=${entry.retryCount})`,
+        );
+        skipped++;
+        continue;
+      }
+
+      const delay = BASE_DELAY_MS * Math.pow(2, entry.retryCount);
+      await sleep(delay);
+
+      this.pipeline?.apply(PipelineTransition.RETRY);
+
+      try {
+        const event = { ...entry.rawPayload, type: entry.eventType } as DomainEvent;
+        const result = await this.dispatcher.dispatch(event, entry.rawPayload);
+        if (result.outcome === 'failed') {
+          throw result.error ?? new Error(`Replay failed for ${entry.eventType}`);
+        }
+
+        // Count replay attempts in total events counter.
+        this.metrics?.incrementDlqEventsTotal(entry.reason, entry.eventType);
+
+        // Mark as successfully replayed (idempotency guard)
+        entry.replayedAt = new Date();
+        await this.repo.save(entry);
+        replayed++;
+        this.pipeline?.apply(PipelineTransition.RETRY_SUCCESS);
+
+        // Successful replay reduces depth for this contract.
+        const contractAddressLabel = entry.contractId ?? 'unknown';
+        const remaining = await this.repo.count({
+          where: { contractId: contractAddressLabel, replayedAt: IsNull() },
+        });
+        this.metrics?.setDlqDepth(contractAddressLabel, remaining);
+
+        this.logger.log(`DLQ: replayed ${entry.eventType} ledger=${entry.ledger} id=${entry.id}`);
+      } catch (err) {
+        entry.retryCount += 1;
+        entry.errorMessage = err instanceof Error ? err.message : String(err);
+        await this.repo.save(entry);
+        failed++;
+        this.pipeline?.apply(
+          entry.retryCount >= MAX_RETRIES
+            ? PipelineTransition.RETRY_EXHAUSTED
+            : PipelineTransition.HANDLER_FAILURE,
+        );
+        this.logger.warn(
+          `DLQ: retry ${entry.retryCount}/${MAX_RETRIES} failed for ${entry.eventType} id=${entry.id}: ${entry.errorMessage}`,
+        );
+      }
+    }
+
+    if (!dryRun) await this.refreshDlqSnapshotMetrics();
+
+    this.logger.log(
+      `DLQ replay complete${dryRun ? ' (dry-run)' : ''}: replayed=${replayed} skipped=${skipped} failed=${failed}`,
+    );
+    return { replayed, skipped, failed, dryRun };
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}

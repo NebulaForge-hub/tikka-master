@@ -1,0 +1,111 @@
+import {
+  CallHandler,
+  ExecutionContext,
+  Injectable,
+  Logger,
+  NestInterceptor,
+} from '@nestjs/common';
+import { Observable, finalize } from 'rxjs';
+import { env } from '../config/env.config';
+import * as Sentry from '@sentry/node';
+import { REQUEST_ID_HEADER } from './request-id.middleware';
+import { getRequestId } from './request-context';
+
+const DEFAULT_REDACT_FIELDS = [
+  'authorization',
+  'token',
+  'privatekey',
+  'secret',
+  'password',
+  'x-api-key',
+];
+
+function getRedactFields(): string[] {
+  const redactEnv = env.logging.redactFields;
+  if (redactEnv) {
+    return redactEnv.split(',').map((f) => f.trim().toLowerCase());
+  }
+  return DEFAULT_REDACT_FIELDS;
+}
+
+export function redact(obj: unknown, fields: string[]): unknown {
+  if (obj === null || obj === undefined) return obj;
+
+  if (Array.isArray(obj)) {
+    return obj.map((item) => redact(item, fields));
+  }
+
+  if (typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+      if (fields.includes(key.toLowerCase())) {
+        result[key] = '[REDACTED]';
+      } else {
+        result[key] = redact(value, fields);
+      }
+    }
+    return result;
+  }
+
+  return obj;
+}
+
+interface HttpRequestLike {
+  method?: string;
+  originalUrl?: string;
+  url?: string;
+  headers?: Record<string, unknown>;
+  body?: unknown;
+}
+
+interface HttpResponseLike {
+  statusCode?: number;
+}
+
+@Injectable()
+export class RequestLoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(RequestLoggingInterceptor.name);
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const request = context.switchToHttp().getRequest<HttpRequestLike>();
+    const response = context.switchToHttp().getResponse<HttpResponseLike>();
+    const startedAt = Date.now();
+
+    // Prefer the id bound to the async context (set by RequestIdMiddleware);
+    // fall back to the raw header for non-HTTP or edge cases.
+    const requestId = getRequestId() ?? (request.headers?.[REQUEST_ID_HEADER] as string);
+
+    // Set Sentry context with request ID
+    if (requestId) {
+      Sentry.setTag('requestId', requestId);
+      Sentry.setContext('request', { id: requestId });
+    }
+
+    return next.handle().pipe(
+      finalize(() => {
+        const method = request.method ?? 'UNKNOWN';
+        const url = this.sanitizeUrl(request.originalUrl ?? request.url);
+        const statusCode = response.statusCode ?? 500;
+        const durationMs = Date.now() - startedAt;
+
+        const redactFields = getRedactFields();
+        const safeHeaders = redact(request.headers ?? {}, redactFields);
+        const safeBody = redact(request.body, redactFields);
+
+        this.logger.log(`${method} ${url} ${statusCode} ${durationMs}ms`, {
+          requestId,
+          headers: safeHeaders,
+          body: safeBody,
+        });
+      }),
+    );
+  }
+
+  private sanitizeUrl(url: string | undefined): string {
+    if (!url) {
+      return 'UNKNOWN';
+    }
+
+    return url.split('?')[0] || '/';
+  }
+}

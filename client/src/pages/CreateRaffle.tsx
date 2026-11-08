@@ -1,0 +1,202 @@
+import React, { useState, useRef, useEffect } from "react";
+import { useTranslation } from "react-i18next";
+import type { RaffleFormData, CreateRaffleStep } from "../types/forms";
+import ProgressStepper from "../components/create-raffle/ProgressStepper";
+import DetailsStep from "../components/create-raffle/DetailsStep";
+import ImageStep from "../components/create-raffle/ImageStep";
+import PricingStep from "../components/create-raffle/PricingStep";
+import DurationStep from "../components/create-raffle/DurationStep";
+import ReviewStep from "../components/create-raffle/ReviewStep";
+import LivePreview from "../components/create-raffle/LivePreview";
+import RestoreDraftModal from "../components/create-raffle/RestoreDraftModal";
+import { useRaffleDraft } from "../components/create-raffle/useRaffleDraft";
+import { Breadcrumbs } from "../components/ui/Breadcrumbs";
+
+const CreateRaffle: React.FC = () => {
+    const { t } = useTranslation("create");
+    const [currentStep, setCurrentStep] = useState(0);
+    const stepPanelRef = useRef<HTMLDivElement>(null);
+    const [formData, setFormData] = useState<RaffleFormData>({
+        title: "",
+        description: "",
+        image: null,
+        images: [],
+        pricePerTicket: 0,
+        totalTickets: 0,
+        duration: {
+            days: 0,
+            hours: 0,
+        },
+    });
+
+    const steps: CreateRaffleStep[] = [
+        {
+            id: "details",
+            title: t("steps.details"),
+            icon: "document",
+            completed: currentStep > 0,
+            active: currentStep === 0,
+        },
+        {
+            id: "image",
+            title: t("steps.image"),
+            icon: "image",
+            completed: currentStep > 1,
+            active: currentStep === 1,
+        },
+        {
+            id: "pricing",
+            title: t("steps.pricing"),
+            icon: "dollar",
+            completed: currentStep > 2,
+            active: currentStep === 2,
+        },
+        {
+            id: "duration",
+            title: t("steps.duration"),
+            icon: "clock",
+            completed: currentStep > 3,
+            active: currentStep === 3,
+        },
+        {
+            id: "review",
+            title: t("steps.review"),
+            icon: "check",
+            completed: currentStep > 4,
+            active: currentStep === 4,
+        },
+    ];
+
+    const {
+        pendingDraft,
+        showRestoreModal,
+        restoreDraft,
+        discardDraft,
+        clearDraft,
+    } = useRaffleDraft({
+        formData,
+        currentStep,
+        setFormData,
+        setCurrentStep,
+    });
+
+    const updateFormData = (data: Partial<RaffleFormData>) => {
+        setFormData((prev) => ({ ...prev, ...data }));
+    };
+
+    const handleNext = () => {
+        if (currentStep < steps.length - 1) {
+            setCurrentStep((prev) => prev + 1);
+        }
+    };
+
+    const handleBack = () => {
+        if (currentStep > 0) {
+            setCurrentStep((prev) => prev - 1);
+        }
+    };
+
+    // Handle keyboard navigation
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            // Enter to advance to next step
+            if (e.key === "Enter" && e.ctrlKey) {
+                e.preventDefault();
+                if (currentStep < steps.length - 1) {
+                    handleNext();
+                }
+            }
+            // Escape to go back
+            if (e.key === "Escape") {
+                e.preventDefault();
+                if (currentStep > 0) {
+                    handleBack();
+                }
+            }
+        };
+
+        document.addEventListener("keydown", handleKeyDown);
+        return () => document.removeEventListener("keydown", handleKeyDown);
+    }, [currentStep, steps.length]);
+
+    // Focus management: focus first focusable element in step panel when step changes
+    useEffect(() => {
+        if (!stepPanelRef.current) return;
+        const focusable = stepPanelRef.current.querySelector<HTMLElement>(
+            'input, textarea, button, [tabindex]:not([tabindex="-1"])'
+        );
+        focusable?.focus();
+    }, [currentStep]);
+
+    const renderCurrentStep = () => {
+        const stepProps = {
+            formData,
+            updateFormData,
+            onNext: handleNext,
+            onBack: handleBack,
+        };
+
+        switch (currentStep) {
+            case 0:
+                return <DetailsStep {...stepProps} />;
+            case 1:
+                return <ImageStep {...stepProps} />;
+            case 2:
+                return <PricingStep {...stepProps} />;
+            case 3:
+                return <DurationStep {...stepProps} />;
+            case 4:
+                return <ReviewStep {...stepProps} onSubmitSuccess={clearDraft} />;
+            default:
+                return <DetailsStep {...stepProps} />;
+        }
+    };
+
+    return (
+        <div className="min-h-screen text-gray-900 dark:text-white">
+            {pendingDraft && (
+                <RestoreDraftModal
+                    open={showRestoreModal}
+                    draft={pendingDraft}
+                    onRestore={restoreDraft}
+                    onDiscard={discardDraft}
+                />
+            )}
+            {/* Header */}
+            <div className="w-full max-w-7xl mx-auto px-6 py-8">
+                <div className="mb-4">
+                    <Breadcrumbs />
+                </div>
+                {/* Page Title */}
+                <div className="text-center mb-8">
+                    <h1 className="text-4xl font-bold text-gray-900 dark:text-white mb-2">
+                        {t("page.title")}
+                    </h1>
+                    <p className="text-gray-700 dark:text-gray-300">
+                        {t("page.subtitle")}
+                    </p>
+                </div>
+
+                {/* Progress Stepper */}
+                <div className="mb-12">
+                    <ProgressStepper steps={steps} currentStep={currentStep} />
+                </div>
+
+                {/* Main Content */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 max-w-6xl mx-auto">
+                    {/* Left Panel - Form */}
+                    <div className="space-y-6" ref={stepPanelRef} role="region" aria-label={t("aria.stepRegion", { number: currentStep + 1, title: steps[currentStep].title })}>
+                        {renderCurrentStep()}
+                    </div>
+
+                    {/* Right Panel - Live Preview */}
+                    <div className="lg:sticky lg:top-8 lg:h-fit">
+                        <LivePreview formData={formData} />
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+};
+
+export default CreateRaffle;

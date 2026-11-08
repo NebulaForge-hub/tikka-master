@@ -1,0 +1,550 @@
+/**
+ * lifecycle.ts
+ *
+ * TransactionLifecycle — owns the full Soroban transaction lifecycle:
+ *
+ *   simulate → sign → submit → poll
+ *
+ * Each phase is a separate method so callers can:
+ *  - Preview fees before asking the user to sign  (simulate)
+ *  - Obtain a signed XDR for offline / multisig flows  (simulate + sign)
+ *  - Submit a pre-signed XDR from an external signer  (submit)
+ *  - Poll separately from submit  (poll)
+ *
+ * The class is intentionally free of NestJS decorators so it can be
+ * unit-tested without the DI container.  ContractService wraps it and
+ * exposes the combined convenience methods (invoke, buildUnsigned, etc.).
+ */
+
+import {
+  TransactionBuilder,
+  Contract,
+  Address,
+  nativeToScVal,
+  rpc,
+  xdr,
+  scValToNative,
+  Memo,
+} from '@stellar/stellar-sdk';
+import { RpcService } from '../network/rpc.service';
+import { HorizonService } from '../network/horizon.service';
+import { NetworkConfig } from '../network/network.config';
+import { WalletAdapter } from '../wallet/wallet.interface';
+import {
+  TikkaSdkError,
+  TikkaSdkErrorCode,
+  TransactionRejectedError,
+  NetworkError,
+  toTypedContractError,
+} from '../utils/errors';
+import type { TikkaLogger } from '../utils/logger';
+import { defaultLogger } from '../utils/logger';
+import { SequenceManager } from './sequence.manager';
+import { classifyError, retryOnTxBadSeq } from './sequence.errors';
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+/**
+ * Transaction memo — attach tracking data or external references.
+ * Mirrors the three Stellar memo types the protocol supports.
+ */
+export type TxMemo =
+  | { type: 'text'; value: string }
+  | { type: 'id'; value: string }
+  | { type: 'hash'; value: Buffer };
+
+/** Successful simulation result — everything needed to decide whether to sign. */
+export interface SimulateResult<T = unknown> {
+  /** Decoded return value of the simulated call (null for void functions). */
+  returnValue: T | null;
+  /** Minimum resource fee in stroops, as a string. */
+  minResourceFee: string;
+  /** Assembled (fee-bumped + auth-populated) transaction XDR, ready to sign. */
+  assembledXdr: string;
+  /** Network passphrase — must be passed to the wallet so it signs the right network. */
+  networkPassphrase: string;
+}
+
+/** Result returned after a transaction is confirmed on-chain. */
+export interface SubmitResult<T = unknown> {
+  /** Decoded on-chain return value (may differ from simulation if contract state changed). */
+  returnValue: T | null;
+  /** Transaction hash. */
+  txHash: string;
+  /** Ledger sequence in which the transaction was included. */
+  ledger: number;
+  /** Base64-encoded transaction result XDR (safe to surface in responses). */
+  resultXdr?: string;
+}
+
+/** Configures the polling loop that waits for transaction confirmation. */
+export interface PollConfig {
+  /**
+   * Maximum time (ms) to wait for the transaction to leave NOT_FOUND status.
+   * @default 60_000
+   */
+  timeoutMs?: number;
+  /**
+   * Initial interval (ms) between poll attempts.
+   * @default 2_000
+   */
+  intervalMs?: number;
+  /**
+   * Exponential backoff factor applied to `intervalMs` after each retry.
+   * 1.0 = no backoff (constant interval). 1.5 = 50% longer each time.
+   * @default 1.5
+   */
+  backoffFactor?: number;
+  /**
+   * Maximum interval (ms) between poll attempts — caps the backoff growth.
+   * @default 10_000
+   */
+  maxIntervalMs?: number;
+}
+
+/** Combined options for a full invoke (simulate + sign + submit + poll). */
+export interface InvokeLifecycleOptions {
+  /** Override the source public key (defaults to wallet.getPublicKey()). */
+  sourcePublicKey?: string;
+  /** Override the transaction base fee (in stroops). Default: BASE_FEE. */
+  fee?: string;
+  /** Polling configuration. */
+  poll?: PollConfig;
+  /** Optional memo attached to the transaction envelope. */
+  memo?: TxMemo;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Detects Soroban contract errors in error messages / XDR. */
+function isExternalContractFailure(msg: string): boolean {
+  return msg.includes('HostError') || msg.includes('WASM') || msg.includes('cross-contract');
+}
+
+// ─── Lifecycle Validation ─────────────────────────────────────────────────────
+
+/**
+ * Valid state transitions for raffle lifecycle operations.
+ * Maps each operation to the required raffle state.
+ */
+export const LIFECYCLE_REQUIREMENTS: Record<string, number> = {
+  buy_ticket: 0, // RaffleStatus.OPEN
+  trigger_draw: 0, // RaffleStatus.OPEN
+  cancel_raffle: 0, // RaffleStatus.OPEN
+};
+
+/**
+ * Validates that a raffle is in the required state for a given operation.
+ * Throws RaffleEndedError if the state does not permit the operation.
+ *
+ * `currentState` may be either a numeric contract state (0 = OPEN … 3 =
+ * CANCELLED) or the string `RaffleStatus` shared by the monorepo packages
+ * ('open' | 'drawing' | 'finalized' | 'cancelled'); both are accepted so
+ * callers can pass values straight from either source.
+ *
+ * @param operation - The contract function name (e.g. 'buy_ticket')
+ * @param currentState - The current raffle state fetched from the contract
+ * @param raffleId - Used in the error message for clarity
+ *
+ * @throws {TikkaSdkError} with code RaffleEnded if state is not permitted
+ */
+export function validateLifecycleTransition(
+  operation: string,
+  currentState: number | string,
+  raffleId: number | string,
+): void {
+  const required = LIFECYCLE_REQUIREMENTS[operation];
+  if (required === undefined) return; // operation has no state requirement
+
+  const stateNames: Record<number, string> = {
+    0: 'OPEN',
+    1: 'DRAWING',
+    2: 'FINALIZED',
+    3: 'CANCELLED',
+  };
+  const statusToCode: Record<string, number> = {
+    open: 0,
+    drawing: 1,
+    finalized: 2,
+    cancelled: 3,
+  };
+
+  const currentCode =
+    typeof currentState === 'number'
+      ? currentState
+      : (statusToCode[String(currentState).toLowerCase()] ?? -1);
+
+  if (currentCode !== required) {
+    const currentName = stateNames[currentCode] ?? String(currentState);
+    const requiredName = stateNames[required] ?? String(required);
+    throw new TikkaSdkError(
+      TikkaSdkErrorCode.RaffleEnded,
+      `Raffle ${raffleId} is in ${currentName} state — operation "${operation}" requires ${requiredName} state.`,
+    );
+  }
+}
+
+// ─── Class ───────────────────────────────────────────────────────────────────
+
+/**
+ * TransactionLifecycle manages the four-phase Soroban transaction lifecycle.
+ *
+ * ## Phase overview
+ *
+ * ```
+ * simulate()   — build tx, call simulateTransaction, assemble fee+auth
+ *   ↓
+ * sign()       — pass assembledXdr to wallet; get signedXdr back
+ *   ↓
+ * submit()     — call sendTransaction with signedXdr
+ *   ↓
+ * poll()       — call getTransaction until SUCCESS / FAILED / timeout
+ * ```
+ *
+ * `invoke()` runs all four phases in sequence and is the most convenient
+ * entry point for standard write operations.
+ *
+ * ## Concurrency & Sequencing
+ *
+ * TransactionLifecycle uses SequenceManager to prevent TX_BAD_SEQ collisions
+ * when multiple operations fire concurrently from the same account.
+ *
+ * - Acquires a per-account lock before fetching sequence
+ * - Ensures strict FIFO ordering for operations from the same account
+ * - Allows parallel operations from different accounts
+ * - Automatically retries on TX_BAD_SEQ with refetched sequence
+ */
+export class TransactionLifecycle {
+  private logger: TikkaLogger;
+  private sequenceManager = new SequenceManager();
+
+  constructor(
+    private readonly rpc: RpcService,
+    private readonly horizon: HorizonService,
+    private readonly networkConfig: NetworkConfig,
+    private wallet: WalletAdapter | undefined,
+    private contractId: string,
+    logger?: TikkaLogger,
+  ) {
+    this.logger = logger ?? defaultLogger;
+  }
+
+  setWallet(adapter: WalletAdapter | undefined): void {
+    this.wallet = adapter;
+  }
+
+  setContractId(id: string): void {
+    this.contractId = id;
+  }
+
+  // ── Phase 1: Simulate ──────────────────────────────────────────────────────
+
+  /**
+   * Builds a transaction for `method` + `params`, simulates it, assembles the
+   * final fee-bumped XDR, and returns the result including the decoded return value.
+   *
+   * Safe to call without a wallet (uses anonymous fallback key).
+   *
+   * @throws `TikkaSdkError(SimulationFailed)` if the RPC returns an error.
+   */
+  async simulate<T = unknown>(
+    method: string,
+    params: unknown[],
+    options: Pick<InvokeLifecycleOptions, 'sourcePublicKey' | 'fee' | 'memo'> = {},
+  ): Promise<SimulateResult<T>> {
+    const sourceKey = options.sourcePublicKey ?? (await this.resolveSourceKey());
+    const tx = await this.buildTx(method, params, sourceKey, options.fee, options.memo);
+
+    const simResponse = await this.rpc.simulateTransaction(tx);
+
+    if (rpc.Api.isSimulationError(simResponse)) {
+      const errMsg = (simResponse as Record<string, unknown>).error ?? '';
+      const message = `Simulation failed for "${method}": ${errMsg}`;
+      throw (
+        toTypedContractError(message, errMsg) ??
+        new TikkaSdkError(TikkaSdkErrorCode.SimulationFailed, message, errMsg)
+      );
+    }
+
+    const success = simResponse as rpc.Api.SimulateTransactionSuccessResponse;
+    const assembled = rpc.assembleTransaction(tx, success).build();
+
+    const returnValue = success.result?.retval ? scValToNative(success.result.retval) : null;
+
+    return {
+      returnValue,
+      minResourceFee: success.minResourceFee,
+      assembledXdr: assembled.toXDR(),
+      networkPassphrase: this.networkConfig.networkPassphrase,
+    };
+  }
+
+  // ── Phase 2: Sign ──────────────────────────────────────────────────────────
+
+  /**
+   * Passes `assembledXdr` to the connected wallet adapter and returns the signed XDR.
+   *
+   * @throws `TikkaSdkError(WalletNotInstalled)` if no wallet adapter is set.
+   * @throws `TikkaSdkError(UserRejected)` if the wallet reports a rejection.
+   */
+  async sign(assembledXdr: string, networkPassphrase?: string): Promise<string> {
+    if (!this.wallet) {
+      throw new TikkaSdkError(
+        TikkaSdkErrorCode.WalletNotInstalled,
+        'No wallet adapter set — cannot sign the transaction',
+      );
+    }
+
+    let signedXdr: string;
+    try {
+      const result = await this.wallet.signTransaction(assembledXdr, {
+        networkPassphrase: networkPassphrase ?? this.networkConfig.networkPassphrase,
+      });
+      signedXdr = result.signedXdr;
+    } catch (err: unknown) {
+      const msg: string = err instanceof Error ? err.message : String(err);
+      const isRejection =
+        msg.toLowerCase().includes('reject') ||
+        msg.toLowerCase().includes('denied') ||
+        msg.toLowerCase().includes('cancel') ||
+        msg.toLowerCase().includes('user declined');
+
+      throw new TikkaSdkError(
+        isRejection ? TikkaSdkErrorCode.UserRejected : TikkaSdkErrorCode.Unknown,
+        `Wallet sign failed: ${msg}`,
+        err,
+      );
+    }
+
+    return signedXdr;
+  }
+
+  // ── Phase 3: Submit ────────────────────────────────────────────────────────
+
+  /**
+   * Submits a signed transaction XDR to the network and returns the transaction hash.
+   *
+   * @throws `TikkaSdkError(SubmissionFailed)` if the RPC rejects the submission.
+   * @throws `TikkaSdkError(NetworkError)` if the RPC is unreachable.
+   */
+  async submit(signedXdr: string): Promise<string> {
+    const signedTx = TransactionBuilder.fromXDR(signedXdr, this.networkConfig.networkPassphrase);
+
+    const sendResp = await this.rpc.sendTransaction(signedTx);
+
+    if (sendResp.status === 'ERROR') {
+      const detail = (sendResp as Record<string, unknown>).errorResultXdr ?? '';
+      throw new TransactionRejectedError(`Transaction submission failed: ${detail}`);
+    }
+
+    return sendResp.hash;
+  }
+
+  // ── Phase 4: Poll ──────────────────────────────────────────────────────────
+
+  /**
+   * Polls the RPC for the transaction status until it reaches SUCCESS or FAILED,
+   * applying exponential backoff between attempts.
+   *
+   * @param txHash  Transaction hash returned by `submit()`.
+   * @param config  Optional polling configuration.
+   * @throws `TikkaSdkError(Timeout)` if the timeout is exceeded.
+   * @throws `TikkaSdkError(ContractError)` if the transaction failed on-chain.
+   * @throws `TikkaSdkError(ExternalContractError)` if a cross-contract call failed.
+   */
+  async poll<T = unknown>(txHash: string, config: PollConfig = {}): Promise<SubmitResult<T>> {
+    const timeoutMs = config.timeoutMs ?? 60_000;
+    const intervalMs = config.intervalMs ?? 2_000;
+    const backoff = config.backoffFactor ?? 1.5;
+    const maxInterval = config.maxIntervalMs ?? 10_000;
+
+    // Requirement 3.10: timeoutMs === 0 must throw immediately without any RPC calls
+    if (timeoutMs === 0) {
+      throw new TikkaSdkError(
+        TikkaSdkErrorCode.Timeout,
+        `Transaction ${txHash} not confirmed within ${timeoutMs}ms (0 attempts)`,
+      );
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    let currentInterval = intervalMs;
+    let attempts = 0;
+
+    while (Date.now() < deadline) {
+      attempts++;
+      let resp: Awaited<ReturnType<typeof this.rpc.getTransaction>>;
+      try {
+        resp = await this.rpc.getTransaction(txHash);
+      } catch (err) {
+        // Treat NetworkError and Timeout from RpcService as transient — apply backoff and retry
+        if (
+          err instanceof TikkaSdkError &&
+          (err.code === TikkaSdkErrorCode.NetworkError || err.code === TikkaSdkErrorCode.Timeout)
+        ) {
+          if (Date.now() + currentInterval >= deadline) break;
+          await this.sleep(currentInterval);
+          currentInterval = Math.min(currentInterval * backoff, maxInterval);
+          continue;
+        }
+        // All other errors propagate immediately
+        throw err;
+      }
+
+      if (resp.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+        const ok = resp as rpc.Api.GetSuccessfulTransactionResponse;
+        return {
+          returnValue: ok.returnValue ? scValToNative(ok.returnValue) : null,
+          txHash,
+          ledger: ok.ledger,
+          resultXdr:
+            typeof ok.resultXdr?.toXDR === 'function'
+              ? ok.resultXdr.toXDR('base64')
+              : String(ok.resultXdr ?? ''),
+        };
+      }
+
+      if (resp.status === rpc.Api.GetTransactionStatus.FAILED) {
+        const resultXdr = (resp as Record<string, unknown>).resultXdr ?? '';
+        const message = `Transaction ${txHash} failed on-chain (attempt ${attempts})`;
+
+        if (isExternalContractFailure(String(resultXdr))) {
+          throw new TikkaSdkError(TikkaSdkErrorCode.ExternalContractError, message, resultXdr);
+        }
+
+        throw (
+          toTypedContractError(message, resultXdr) ??
+          new TikkaSdkError(TikkaSdkErrorCode.ContractError, message, resultXdr)
+        );
+      }
+
+      // NOT_FOUND — apply backoff and retry
+      if (Date.now() + currentInterval >= deadline) break;
+      await this.sleep(currentInterval);
+      currentInterval = Math.min(currentInterval * backoff, maxInterval);
+    }
+
+    throw new TikkaSdkError(
+      TikkaSdkErrorCode.Timeout,
+      `Transaction ${txHash} not confirmed within ${timeoutMs}ms (${attempts} attempts)`,
+    );
+  }
+
+  // ── Combined: invoke ───────────────────────────────────────────────────────
+
+  /**
+   * Convenience method that runs all four phases in sequence:
+   * simulate → sign → submit → poll.
+   *
+   * Includes automatic TX_BAD_SEQ retry with sequence refetch.
+   *
+   * @throws Any of the per-phase errors (unless they are TX_BAD_SEQ, which are retried).
+   */
+  async invoke<T = unknown>(
+    method: string,
+    params: unknown[],
+    options: InvokeLifecycleOptions = {},
+  ): Promise<SubmitResult<T>> {
+    if (!this.wallet) {
+      throw new TikkaSdkError(TikkaSdkErrorCode.WalletNotInstalled, 'Wallet required for invoke()');
+    }
+
+    const sourceKey = options.sourcePublicKey ?? (await this.wallet.getPublicKey());
+
+    // Retry on TX_BAD_SEQ: refetch sequence and retry the full invoke pipeline
+    const retryResult = await retryOnTxBadSeq(
+      async () => {
+        const sim = await this.simulate<T>(method, params, options);
+        const signedXdr = await this.sign(sim.assembledXdr, sim.networkPassphrase);
+        const txHash = await this.submit(signedXdr);
+        return this.poll<T>(txHash, options.poll);
+      },
+      async () => this.horizon.loadAccount(sourceKey),
+      { maxAttempts: 2 },
+    );
+
+    if (!retryResult.success) {
+      throw retryResult.error;
+    }
+
+    return retryResult.value!;
+  }
+
+  // ── Helpers ────────────────────────────────________________________________
+
+  private async resolveSourceKey(): Promise<string> {
+    if (this.wallet) {
+      try {
+        return await this.wallet.getPublicKey();
+      } catch {
+        // fall through
+      }
+    }
+    return 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF';
+  }
+
+  private async buildTx(
+    method: string,
+    params: unknown[],
+    sourceKey: string,
+    fee?: string,
+    memo?: TxMemo,
+  ) {
+    // Acquire per-account lock to prevent sequence collisions
+    const release = await this.sequenceManager.lock(sourceKey);
+
+    try {
+      const account = await this.horizon.loadAccount(sourceKey).catch(
+        () =>
+          ({
+            accountId: () => sourceKey,
+            sequenceNumber: () => '0',
+            incrementSequenceNumber: () => {},
+          }) as xdr.Account,
+      );
+
+      let finalFee = fee;
+      if (!finalFee) {
+        const { suggestedFee } = await this.rpc.estimateFee();
+        finalFee = String(suggestedFee);
+      }
+
+      const contract = new Contract(this.contractId);
+      const builder = new TransactionBuilder(account, {
+        fee: finalFee,
+        networkPassphrase: this.networkConfig.networkPassphrase,
+      }).addOperation(contract.call(method, ...params.map((p) => this.toScVal(p))));
+
+      if (memo) {
+        builder.addMemo(this.buildMemo(memo));
+      }
+
+      return builder.setTimeout(30).build();
+    } finally {
+      // Always release the lock, even if an error occurs
+      release();
+    }
+  }
+
+  private buildMemo(memo: TxMemo): Memo {
+    switch (memo.type) {
+      case 'text':
+        return Memo.text(memo.value);
+      case 'id':
+        return Memo.id(memo.value);
+      case 'hash':
+        return Memo.hash(memo.value);
+    }
+  }
+
+  private toScVal(val: unknown): xdr.ScVal {
+    if (val instanceof xdr.ScVal) return val;
+    if (typeof val === 'string' && val.length === 56) {
+      return new Address(val).toScVal();
+    }
+    return nativeToScVal(val);
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}

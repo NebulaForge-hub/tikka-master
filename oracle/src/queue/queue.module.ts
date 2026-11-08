@@ -1,0 +1,80 @@
+import { Module } from '@nestjs/common';
+import { BullModule } from '@nestjs/bull';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { RandomnessWorker } from './randomness.worker';
+import { CommitRevealWorker } from './commit-reveal.worker';
+import { JobStateManager } from './job-state-manager';
+import { RandomnessProcessorService } from './randomness-processor.service';
+import { QueueHealthController } from './queue-health.controller';
+import { ContractService } from '../contract/contract.service';
+import { VrfService } from '../randomness/vrf.service';
+import { PrngService } from '../randomness/prng.service';
+import { CommitmentService } from '../randomness/commitment.service';
+import { TxSubmitterService } from '../submitter/tx-submitter.service';
+import { FeeEstimatorService } from '../submitter/fee-estimator.service';
+import { FeeStrategyService } from '../submitter/fee-strategy';
+import { TxBuilderService } from '../submitter/tx-builder';
+import { SubmissionService } from '../submitter/submission';
+import { HealthModule } from '../health/health.module';
+import { HealthService } from '../health/health.service';
+import { LagMonitorService } from '../health/lag-monitor.service';
+import { MetricsModule } from '../metrics/metrics.module';
+import { RANDOMNESS_QUEUE } from './randomness.queue';
+import { AuditLogModule } from '../audit/audit.module';
+import { PriorityClassifierService } from './priority-classifier.service';
+
+@Module({
+  imports: [
+    HealthModule,
+    MetricsModule,
+    AuditLogModule,
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      useFactory: async (configService: ConfigService) => ({
+        redis: {
+          host: configService.get<string>('REDIS_HOST', 'localhost'),
+          port: configService.get<number>('REDIS_PORT', 6379),
+        },
+      }),
+      inject: [ConfigService],
+    }),
+    BullModule.registerQueue({
+      name: RANDOMNESS_QUEUE,
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: { type: 'exponential', delay: 2000 },
+        removeOnComplete: true,
+        removeOnFail: false,
+      },
+    }),
+  ],
+  providers: [
+    JobStateManager,
+    RandomnessProcessorService,
+    RandomnessWorker,
+    CommitRevealWorker,
+    QueueHealthController,
+    ContractService,
+    VrfService,
+    PrngService,
+    CommitmentService,
+    TxSubmitterService,
+    FeeEstimatorService,
+    FeeStrategyService,
+    TxBuilderService,
+    SubmissionService,
+    HealthService,
+    LagMonitorService,
+    PriorityClassifierService,
+  ],
+  controllers: [QueueHealthController],
+  exports: [
+    JobStateManager,
+    RandomnessProcessorService,
+    RandomnessWorker,
+    CommitRevealWorker,
+    BullModule.registerQueue({ name: RANDOMNESS_QUEUE }),
+    PriorityClassifierService,
+  ],
+})
+export class QueueModule { }

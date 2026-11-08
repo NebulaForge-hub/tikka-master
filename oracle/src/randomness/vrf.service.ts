@@ -1,0 +1,165 @@
+import { OracleLoggerService } from '../logger/oracle-logger';
+import { Injectable, Logger } from '@nestjs/common';
+import { RandomnessResult } from '../queue/queue.types';
+import { KeyService } from '../keys/key.service';
+import { OracleRegistryService } from '../multi-oracle/oracle-registry.service';
+import { ed25519 } from '@noble/curves/ed25519';
+import * as crypto from 'crypto';
+import { IVrfProvider, VrfAlgorithm } from './vrf.interface';
+import { Ed25519Sha256VrfProvider } from './ed25519-sha256.vrf-provider';
+import { MetricsService } from '../metrics/metrics.service';
+import { AlertingService } from '../health/alerting.service';
+
+const VRF_KEY_UNAVAILABLE_ALERT_DEDUP_KEY = 'vrf-key-unavailable';
+
+/**
+ * VrfService — Verifiable Random Function computation for high-stakes raffles.
+ *
+ * When prize >= 500 XLM, uses Ed25519 VRF for cryptographic security:
+ *   input = requestId_bytes [|| raffleId_u32_BE]
+ *   proof = ed25519.sign(input, oraclePrivateKey)
+ *   seed  = SHA-256(proof)
+ *
+ * The contract verifies the proof using the oracle's public key, ensuring
+ * the oracle cannot manipulate the outcome.
+ *
+ * Supports both single-oracle and multi-oracle modes.
+ */
+@Injectable()
+export class VrfService {
+  
+  private readonly ed25519Provider: Ed25519Sha256VrfProvider;
+
+  constructor(
+    private readonly logger: OracleLoggerService,
+    private readonly keyService: KeyService,
+    private readonly oracleRegistry: OracleRegistryService,
+    private readonly metricsService: MetricsService,
+    private readonly alertingService: AlertingService,
+  ) {
+    this.ed25519Provider = new Ed25519Sha256VrfProvider(keyService, metricsService);
+  }
+
+  /**
+   * Compute VRF output using the oracle's private key.
+   *
+   * @param requestId  Unique request identifier from the RandomnessRequested event.
+   * @param raffleId   Optional raffle ID — mixed into the input so two raffles
+   *                   with the same requestId still produce distinct seeds.
+   */
+  async compute(requestId: string, raffleId?: number): Promise<RandomnessResult> {
+    try {
+      const result = await this.ed25519Provider.compute(requestId, raffleId);
+      void this.alertingService.resolve(VRF_KEY_UNAVAILABLE_ALERT_DEDUP_KEY);
+      return result;
+    } catch (error: any) {
+      void this.alertingService.fire({
+        severity: 'critical',
+        summary: 'VRF signing key unavailable',
+        details: error?.message || String(error),
+        dedupKey: VRF_KEY_UNAVAILABLE_ALERT_DEDUP_KEY,
+        context: {
+          oracle_id: process.env.LOCAL_ORACLE_ID || 'oracle-001',
+          raffle_id: raffleId,
+          request_id: requestId,
+        },
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Compute VRF output using a specific private key.
+   * Core VRF computation:
+   *   proof = ed25519.sign(requestId, privateKey)
+   *   seed  = SHA-256(proof)
+   *
+   * @deprecated This method exposes raw private keys. Use compute() instead.
+   */
+  computeWithKey(requestId: string, privateKey: Buffer): RandomnessResult {
+    this.logger.debug(`Computing VRF for requestId=${requestId}`);
+
+    const msg = Buffer.from(requestId, 'utf-8');
+    const proof = ed25519.sign(msg, privateKey);
+    const seed = crypto.createHash('sha256').update(proof).digest();
+
+    return {
+      seed: Buffer.from(seed).toString('hex'),
+      proof: Buffer.from(proof).toString('hex'),
+    };
+  }
+
+  /**
+   * Compute VRF output for a specific oracle in multi-oracle mode.
+   */
+  async computeForOracle(requestId: string, oracleId: string, raffleId?: number): Promise<RandomnessResult> {
+    const oracle = this.oracleRegistry.getOracle(oracleId);
+    if (!oracle) {
+      throw new Error(`Oracle not found: ${oracleId}`);
+    }
+
+    if (oracleId === this.oracleRegistry.getLocalOracleId()) {
+      return this.compute(requestId, raffleId);
+    }
+
+    throw new Error('computeForOracle only supported for local oracle in multi-oracle mode currently');
+  }
+
+  /**
+   * Verify VRF output using the oracle's public key.
+   * Anyone can verify the output is authentic and unmanipulated.
+   *
+   * @returns true if proof is valid and seed is correct; false otherwise
+   */
+  verify(
+    publicKey: string | Buffer,
+    requestId: string,
+    proof: string,
+    seed: string,
+    raffleId?: number,
+  ): boolean {
+    const verifiedProof = this.verifyProof({
+      publicKey,
+      requestId,
+      proof,
+      raffleId,
+    });
+    if (!verifiedProof.valid || !verifiedProof.seed) return false;
+
+    try {
+      const expectedSeed = Buffer.from(verifiedProof.seed, 'hex');
+      const providedSeed = Buffer.from(seed, 'hex');
+      return Buffer.compare(expectedSeed, providedSeed) === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Verify a VRF proof and derive the seed when valid.
+   */
+  verifyProof(input: {
+    requestId: string;
+    proof: string;
+    publicKey: string | Buffer;
+    raffleId?: number;
+  }): { valid: boolean; seed?: string } {
+    return this.ed25519Provider.verifyProof(
+      input.publicKey,
+      input.requestId,
+      input.proof,
+      input.raffleId,
+    );
+  }
+
+  /**
+   * Return the local oracle's public key in common encodings.
+   */
+  async getPublicKey(): Promise<{ hex: string; base64: string }> {
+    const keyBuffer = await this.keyService.getPublicKeyBuffer();
+    return {
+      hex: keyBuffer.toString('hex'),
+      base64: keyBuffer.toString('base64'),
+    };
+  }
+}

@@ -1,0 +1,1120 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Guard: verify the packageManager field carries a valid 128-char SHA-512 hex
+  # digest so corepack strict mode cannot be silently broken by a hand-edit.
+  # Runs on every push/PR, needs no Node setup beyond the runner's built-in node.
+  check-package-manager-hash:
+    name: Verify packageManager hash length
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Assert SHA-512 digest is 128 hex characters
+        run: |
+          HASH=$(node -e "console.log(require('./package.json').packageManager.split('+sha512.')[1])")
+          LEN=${#HASH}
+          if [ "$LEN" -ne 128 ]; then
+            echo "❌ packageManager hash is $LEN characters — expected 128."
+            echo "   Run: corepack use pnpm@9.15.9   and commit the result."
+            exit 1
+          fi
+          echo "✅ packageManager hash length is $LEN — OK"
+
+  # Detect whether any source files changed.
+  # Docs-only PRs (changes only inside docs/) skip the turbo job entirely.
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.filter.outputs.source }}
+      client: ${{ steps.filter.outputs.client }}
+      sdk: ${{ steps.filter.outputs.sdk }}
+      backend: ${{ steps.filter.outputs.backend }}
+      indexer: ${{ steps.filter.outputs.indexer }}
+      oracle: ${{ steps.filter.outputs.oracle }}
+      database: ${{ steps.filter.outputs.database }}
+      migrations: ${{ steps.filter.outputs.migrations }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check workspace tsconfig inheritance
+        run: node scripts/check-tsconfig-base.js
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            source:
+              - 'client/**'
+              - 'packages/types/**'
+              - 'backend/openapi.json'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - '.github/workflows/ci.yml'
+            sdk:
+              - 'sdk/**'
+              - 'backend/**'
+              - 'indexer/**'
+              - 'oracle/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - '.github/workflows/ci.yml'
+            backend:
+              - 'backend/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - '.github/workflows/ci.yml'
+            indexer:
+              - 'indexer/**'
+              - 'packages/types/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - 'turbo.json'
+              - '.github/workflows/ci.yml'
+            oracle:
+              - 'oracle/**'
+              - 'package.json'
+              - 'pnpm-workspace.yaml'
+              - '.github/workflows/ci.yml'
+            compose:
+              - 'docker-compose.yml'
+              - 'backend/Dockerfile'
+              - 'client/Dockerfile'
+              - 'indexer/Dockerfile'
+              - 'oracle/Dockerfile'
+              - '.github/workflows/ci.yml'
+            database:
+              - 'indexer/src/database/**'
+              - 'backend/**'
+              - '.github/workflows/ci.yml'
+            migrations:
+              - 'backend/database/migrations/**'
+              - 'oracle/database/migrations/**'
+              - 'indexer/src/database/migrations/**'
+              - 'db/migrations/**'
+              - 'db/baseline-schema.sql'
+              - 'scripts/check-schema-drift.ts'
+              - '.github/workflows/ci.yml'
+
+  # Single Turborepo job: lint → test → build (typecheck) across all packages.
+  # Turbo's task graph ensures sdk builds before anything that depends on it,
+  # and its local cache means an unchanged package's tasks are served from cache.
+  turbo:
+    name: Turbo — lint, test, typecheck, build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.source == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify Node version consistency
+        run: pnpm run check:node-version
+
+      - name: Check colour contrast (WCAG AA)
+        run: node scripts/check-contrast.js
+        continue-on-error: false
+
+      - name: Check generated API types are up to date
+        run: |
+          pnpm run generate:types
+          if ! git diff --exit-code src/types/api.generated.ts; then
+            echo "❌ api.generated.ts is stale — run 'pnpm generate:types' and commit the result"
+            exit 1
+          fi
+        continue-on-error: false
+
+      - name: Lint
+        run: pnpm run lint
+        continue-on-error: false
+
+      - name: Run unit tests
+        run: pnpm run test:unit -- --coverage --coverage.thresholds.lines=80 --coverage.thresholds.functions=80 --coverage.thresholds.branches=80 --coverage.thresholds.statements=80
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-client
+          path: client/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build
+        run: pnpm run build
+        continue-on-error: false
+
+      - name: Self-test client entry chunk guard
+        run: pnpm --dir client run test:bundle-check
+        continue-on-error: false
+
+      - name: Report client bundle budgets and check entry graph
+        run: pnpm --dir client run report:bundle-budget
+        if: always()
+        continue-on-error: false
+
+      - name: Generate OpenAPI and ensure committed spec is up-to-date
+        run: |
+          pnpm run generate:openapi
+          git --no-pager diff --exit-code openapi.json
+
+      - name: Validate OpenAPI spec
+        run: pnpm run validate:openapi
+
+      - name: Upload OpenAPI artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: backend-openapi
+          path: openapi.json
+          retention-days: 7
+
+      - name: Install Playwright browsers
+        run: npx playwright install chromium --with-deps
+        continue-on-error: false
+
+      - name: Run e2e accessibility tests
+        run: pnpm run test:e2e -- --grep "Accessibility"
+        continue-on-error: true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: client-build
+          path: client/dist
+          retention-days: 7
+
+  # SDK package
+  sdk:
+    name: SDK - Lint, Test, Build, Docs
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.sdk == 'true'
+    defaults:
+      run:
+        working-directory: ./sdk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared SDK types
+        run: pnpm --filter @tikka/types build
+
+      - name: Lint
+        run: pnpm run lint
+        continue-on-error: false
+
+      - name: Typecheck
+        run: pnpm run typecheck
+        continue-on-error: false
+
+      - name: Verify contract bindings are up to date
+        run: |
+          # Ensure generated bindings exist and are non-empty
+          if [ ! -s src/contract/generated/bindings.ts ]; then
+            echo "❌ src/contract/generated/bindings.ts is missing or empty"
+            exit 1
+          fi
+          # Ensure no 'any' types remain in src/contract/
+          if grep -rn '\bany\b' src/contract/ --include='*.ts' | grep -v '.spec.ts'; then
+            echo "❌ Found 'any' types in src/contract/ — remove them or use parsers"
+            exit 1
+          fi
+          echo "✅ Contract bindings verified — no 'any' in src/contract/"
+        continue-on-error: false
+
+      - name: Run tests
+        run: pnpm run test --coverage
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-sdk
+          path: sdk/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build
+        run: pnpm run build
+        continue-on-error: false
+
+      - name: Build read and light entry points
+        run: pnpm run build:read && pnpm run build:light
+        continue-on-error: false
+
+      # `npm pack --dry-run` is the only honest view of the published package:
+      # it applies `files`, the .gitignore fallback (which ignores /dist) and
+      # npm's always-included entries. Fails if anything but dist/, bin/ and the
+      # documented docs would ship — see sdk/scripts/check-pack.mjs.
+      - name: Packaging check (published artifacts)
+        run: pnpm run pack:check
+        continue-on-error: false
+
+      - name: API surface report check
+        run: |
+          pnpm exec api-extractor run --config api-extractor.json
+          pnpm exec api-extractor run --config api-extractor.read.json
+          pnpm exec api-extractor run --config api-extractor.write.json
+          pnpm exec api-extractor run --config api-extractor.light.json
+        continue-on-error: false
+
+      - name: Assert light bundle excludes NestJS
+        run: pnpm run analyze:light
+        continue-on-error: false
+
+      - name: Check bundle size budgets
+        run: |
+          pnpm exec size-limit --json > size-summary.json || SIZE_CHECK_EXIT_CODE=$?
+          node -e '
+            const fs = require("fs");
+            const data = JSON.parse(fs.readFileSync("size-summary.json", "utf8"));
+            if (!Array.isArray(data) || data.some((item) => typeof item.size !== "number")) {
+              throw new Error("size-limit returned an invalid JSON summary");
+            }
+            let summary = "### SDK Bundle Size Budgets\n\n";
+            summary += "Minified and gzipped bundle sizes.\n\n";
+            summary += "| Bundle | Size | Limit | Status |\n";
+            summary += "| --- | --- | --- | --- |\n";
+            for (const item of data) {
+              const limit = item.sizeLimit ?? "N/A";
+              const status = item.passed === false ? "Exceeded" : "Passed";
+              summary += `| ${item.name} | ${item.size.toLocaleString()} B | ${limit.toLocaleString()} B | ${status} |\n`;
+            }
+            const main = data.find((item) => item.name === "@tikka/sdk .");
+            const light = data.find((item) => item.name === "@tikka/sdk ./light");
+            if (!main || !light) throw new Error("Missing main or light SDK size result");
+            if (light.size >= main.size) {
+              summary += "\nThe light entry must remain smaller than the main entry.\n";
+              process.exitCode = 1;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          '
+          exit "${SIZE_CHECK_EXIT_CODE:-0}"
+        continue-on-error: false
+
+      - name: Generate docs
+        run: pnpm run docs
+        continue-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sdk-build
+          path: sdk/dist
+          retention-days: 7
+
+  # Backend package
+  backend:
+    name: Backend - Lint, Test, Build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    defaults:
+      run:
+        working-directory: ./backend
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+        continue-on-error: false
+
+      - name: Run tests (mocked)
+        run: pnpm run test -- --coverage --coverageThreshold='{"global":{"branches":80,"functions":80,"lines":80,"statements":80}}'
+        env:
+          NODE_ENV: test
+        continue-on-error: false
+
+      - name: Validate OpenAPI Spec
+        run: pnpm run validate:openapi
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-backend
+          path: backend/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Check module boundaries (dependency-cruiser)
+        run: pnpm run boundaries
+        continue-on-error: false
+
+      - name: Build
+        run: pnpm run build
+        continue-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: backend-build
+          path: backend/dist
+          retention-days: 7
+
+  # Indexer package
+  indexer:
+    name: Indexer - Lint, Test, Build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.indexer == 'true'
+    defaults:
+      run:
+        working-directory: ./indexer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+        continue-on-error: false
+
+      - name: Typecheck
+        run: pnpm run typecheck
+        continue-on-error: false
+
+      - name: Run unit tests (network tests excluded)
+        run: pnpm run test -- --coverage
+        env:
+          NODE_ENV: test
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-indexer
+          path: indexer/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build
+        run: pnpm run build
+        continue-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: indexer-build
+          path: indexer/dist
+          retention-days: 7
+
+  # Oracle package
+  oracle:
+    name: Oracle - Lint, Test, Build
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.oracle == 'true'
+    defaults:
+      run:
+        working-directory: ./oracle
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint
+        run: pnpm run lint
+        continue-on-error: false
+
+      - name: Run tests (mocked)
+        run: pnpm run test -- --coverage --coverageThreshold='{"global":{"branches":80,"functions":80,"lines":80,"statements":80}}'
+        env:
+          NODE_ENV: test
+        continue-on-error: false
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-oracle
+          path: oracle/coverage/lcov.info
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Build
+        run: pnpm run build
+        continue-on-error: false
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: oracle-build
+          path: oracle/dist
+          retention-days: 7
+
+  # Verify a build + test run leaves the working tree clean (no committed artifacts)
+  verify-clean-tree:
+    name: Verify Clean Working Tree
+    runs-on: ubuntu-latest
+    needs: [changes, sdk, backend, indexer, oracle]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Client - install, lint, test, build
+        working-directory: ./client
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run test:unit
+          pnpm run build
+
+      - name: SDK - install, lint, test, build
+        working-directory: ./sdk
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+
+      - name: Backend - install, lint, test, build
+        working-directory: ./backend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+        env:
+          NODE_ENV: test
+
+      - name: Indexer - install, lint, test, build
+        working-directory: ./indexer
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+        env:
+          NODE_ENV: test
+
+      - name: Oracle - install, lint, test, build
+        working-directory: ./oracle
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run lint
+          pnpm run test
+          pnpm run build
+        env:
+          NODE_ENV: test
+
+      - name: Fail if working tree is dirty
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "❌ Working tree is dirty after build + test run:"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          echo "✅ Working tree is clean after build + test run"
+
+  # Docker Compose smoke test - verifies documented profiles
+  compose-smoke:
+    name: Docker Compose Smoke Test
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.compose == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Build and start services with full profile
+        run: docker compose --profile full up -d --build --wait
+
+      - name: Build and start client profile
+        if: hashFiles('client/Dockerfile') != ''
+        run: docker compose --profile client up -d --build --wait
+
+      - name: Assert service health endpoints
+        run: |
+          set -euo pipefail
+          curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://localhost:3001/health
+          curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://localhost:3002/
+          curl --fail --retry 5 --retry-connrefused --retry-delay 2 http://localhost:3003/
+
+      - name: Tear down services
+        if: always()
+        run: docker compose down -v
+
+  # Postgres hot-path audit - flags sequential scans on the indexer query hotspots
+  postgres-hotpath-audit:
+    name: Postgres Hot-Path Audit
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.database == 'true' || needs.changes.outputs.indexer == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Start Postgres with pg_stat_statements enabled
+        run: docker compose up -d postgres
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run hot-path sequential scan guard
+        run: pnpm --dir indexer run check:hotpath-seqscan
+        env:
+          DATABASE_URL: postgresql://tikka:tikka-pass@127.0.0.1:5432/tikka
+
+      - name: Tear down Postgres
+        if: always()
+        run: docker compose down -v
+
+  # Observability assets - dashboard queries must resolve to metrics the code emits
+  observability:
+    name: Observability - Validate Dashboard Metrics
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Validate dashboard and alert queries against METRICS_MAP.md
+        run: node scripts/check-dashboard-metrics.js
+
+  # Secret scanning - blocks PRs that contain verified secrets
+  security-scan:
+    name: Secret Scanning (TruffleHog)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog secret scan
+        uses: trufflesecurity/trufflehog@4dd8831c5f12599465d4d45c3c447b4018a34c85 # main
+        with:
+          path: ./
+          base: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          head: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.after }}
+          extra_args: >-
+            --only-verified
+            --exclude-paths .trufflehog-exclude
+
+  coverage-summary:
+    name: Coverage Summary
+    runs-on: ubuntu-latest
+    needs: [turbo, sdk, backend, indexer, oracle]
+    if: ${{ always() }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: coverage
+          pattern: coverage-*
+      - name: Generate coverage table
+        run: |
+          echo "## Coverage Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Lines | Functions | Branches |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------|-----------|----------|" >> $GITHUB_STEP_SUMMARY
+          for artifact in coverage/coverage-*; do
+            pkg=${artifact#coverage/coverage-}
+            lcov=$(find "$artifact" -name lcov.info -print -quit)
+            if [ -f "$lcov" ]; then
+              lines=$(awk -F: '/^LF:/{lf+=$2}/^LH:/{lh+=$2}END{printf "%.1f%%", (lf>0?100*lh/lf:0)}' "$lcov")
+              functions=$(awk -F: '/^FNF:/{fnf+=$2}/^FNH:/{fnh+=$2}END{printf "%.1f%%", (fnf>0?100*fnh/fnf:0)}' "$lcov")
+              branches=$(awk -F: '/^BRF:/{brf+=$2}/^BRH:/{brh+=$2}END{printf "%.1f%%", (brf>0?100*brh/brf:0)}' "$lcov")
+              echo "| $pkg | $lines | $functions | $branches |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| $pkg | N/A | N/A | N/A |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+  # Lighthouse CI for client performance budgets
+  lighthouse:
+    name: Lighthouse CI - Performance Budgets
+    runs-on: ubuntu-latest
+    needs: turbo
+    if: needs.turbo.result == 'success'
+    defaults:
+      run:
+        working-directory: ./client
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: client-build
+          path: client/dist
+
+      - name: Run Lighthouse CI
+        run: |
+          pnpm exec lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+      - name: Upload Lighthouse results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: lighthouse-results
+          path: |
+            client/.lighthouseci
+          retention-days: 30
+
+      - name: Comment PR with Lighthouse results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Read the Lighthouse results
+            const resultsPath = path.join(process.cwd(), 'client/.lighthouseci');
+
+            if (!fs.existsSync(resultsPath)) {
+              console.log('No Lighthouse results found');
+              return;
+            }
+
+            // Find the manifest file
+            const files = fs.readdirSync(resultsPath);
+            const manifestFile = files.find(f => f.includes('manifest.json'));
+
+            if (!manifestFile) {
+              console.log('No manifest file found');
+              return;
+            }
+
+            const manifest = JSON.parse(
+              fs.readFileSync(path.join(resultsPath, manifestFile), 'utf8')
+            );
+
+            // Get the first result
+            const result = manifest[0];
+            const summary = result.summary;
+
+            // Create comment body
+            const comment = `## 🔦 Lighthouse CI Results
+
+            Performance metrics for this build:
+
+            | Metric | Score | Status |
+            |--------|-------|--------|
+            | 🎨 Performance | ${Math.round(summary.performance * 100)} | ${summary.performance >= 0.9 ? '✅' : '⚠️'} |
+            | ♿ Accessibility | ${Math.round(summary.accessibility * 100)} | ${summary.accessibility >= 0.9 ? '✅' : '⚠️'} |
+            | 🎯 Best Practices | ${Math.round(summary['best-practices'] * 100)} | ${summary['best-practices'] >= 0.9 ? '✅' : '⚠️'} |
+            | 🔍 SEO | ${Math.round(summary.seo * 100)} | ${summary.seo >= 0.9 ? '✅' : '⚠️'} |
+
+            [📊 View full Lighthouse report](${result.url})
+
+            ### Core Web Vitals
+            - **LCP (Largest Contentful Paint)**: Target < 2.5s
+            - **CLS (Cumulative Layout Shift)**: Target < 0.1
+            - **FCP (First Contentful Paint)**: Target < 2.0s
+            `;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Commit message linting - ensures commit messages follow conventional commits format
+  commitlint:
+    name: Commit Message Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate PR commits with commitlint
+        if: github.event_name == 'pull_request'
+        run: pnpm exec commitlint --from ${{ github.event.pull_request.base.sha }} --to ${{ github.event.pull_request.head.sha }}
+
+      - name: Validate last commit on push
+        if: github.event_name == 'push'
+        run: pnpm exec commitlint --from HEAD~1 --to HEAD
+
+  # Documentation policy enforcement - rejects non-README markdown in src/ directories
+  docs-policy:
+    name: Documentation Policy Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Check for non-README markdown files in src/ directories
+        run: |
+          echo "Checking for non-README markdown files in src/ directories..."
+          
+          # Find all markdown files in src/ directories, excluding node_modules
+          FOUND_FILES=$(find . -path '*/src/*.md' \
+            -not -path '*/node_modules/*' \
+            -not -name 'README.md' \
+            -type f || true)
+          
+          if [ -n "$FOUND_FILES" ]; then
+            echo "❌ Error: Found non-README markdown files in src/ directories:"
+            echo ""
+            echo "$FOUND_FILES"
+            echo ""
+            echo "Source directories (*/src/) should only contain code and README.md files."
+            echo "Please move documentation to the appropriate location:"
+            echo "  - Package guides: <package>/docs/ (e.g., oracle/docs/, indexer/docs/)"
+            echo "  - Cross-package docs: docs/ at repository root"
+            echo "  - Historical notes: docs/archive/ with date prefix"
+            echo ""
+            echo "See CONTRIBUTING.md § Documentation policy for details."
+            exit 1
+          fi
+          
+          echo "✅ No non-README markdown files found in src/ directories"
+
+  # Format checking - ensures codebase adheres to Prettier config
+  format:
+    name: Prettier Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check formatting
+        run: pnpm exec prettier --check .
+
+  # Check that PRs touching sdk/src include a changeset
+  changeset-check:
+    name: SDK Changeset Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify changeset for SDK changes
+        run: |
+          git fetch origin ${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }} || true
+          SDK_CHANGES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '^sdk/src/' || true)
+          if [ -n "$SDK_CHANGES" ]; then
+            echo "SDK source files modified:"
+            echo "$SDK_CHANGES"
+            echo ""
+            CHANGESET_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -E '^\.changeset/.*\.md$' | grep -v 'README.md' || true)
+            if [ -z "$CHANGESET_FILES" ]; then
+              echo "❌ Error: PR modifies files in sdk/src/ but does not contain a changeset file in .changeset/!"
+              echo "Please run 'pnpm changeset' locally and commit the generated changeset file."
+              exit 1
+            else
+              echo "✅ Found changeset file(s):"
+              echo "$CHANGESET_FILES"
+            fi
+          else
+            echo "✅ No changes to sdk/src/. Changeset check skipped."
+          fi
+
+  # Schema drift check - verifies db/baseline-schema.sql matches the output of
+  # running all committed migrations (backend, oracle, indexer) against a fresh
+  # PostgreSQL instance.  Runs on every PR that touches any migration path or
+  # the baseline file itself.  Fails if the baseline is stale.
+  schema-drift:
+    name: Schema Drift Check
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.migrations == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 9.15.9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: 'pnpm'
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install root dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install indexer dependencies (needed for migration:run)
+        run: pnpm install --frozen-lockfile
+        working-directory: ./indexer
+
+      - name: Run drift-check unit tests (no Docker required)
+        run: pnpm test:scripts
+
+      - name: Run schema drift check
+        run: pnpm db:check-drift
+        # Docker is available on ubuntu-latest; the script spins up its own
+        # postgres:16-alpine container automatically when DATABASE_URL is unset.
+
+      - name: Fail with remediation hint on drift
+        if: failure()
+        run: |
+          echo ""
+          echo "❌ db/baseline-schema.sql is out of date."
+          echo ""
+          echo "   Fix: run the following locally against a fresh database with all"
+          echo "   migrations applied, then commit the updated baseline:"
+          echo ""
+          echo "     pnpm db:check-drift -- --update-baseline"
+          echo ""
+          echo "   Include the updated db/baseline-schema.sql in this PR."
+
+  # Summary job - fails if any package fails
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs:
+      [
+        commitlint,
+        docs-policy,
+        turbo,
+        sdk,
+        backend,
+        indexer,
+        oracle,
+        observability,
+        security-scan,
+        lighthouse,
+        coverage-summary,
+        schema-drift,
+      ]
+    if: always()
+    steps:
+      - name: Download coverage - client
+        if: needs.turbo.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-client
+          path: coverage/client
+      - name: Download coverage - sdk
+        if: needs.sdk.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-sdk
+          path: coverage/sdk
+      - name: Download coverage - backend
+        if: needs.backend.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-backend
+          path: coverage/backend
+      - name: Download coverage - indexer
+        if: needs.indexer.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-indexer
+          path: coverage/indexer
+      - name: Download coverage - oracle
+        if: needs.oracle.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: coverage-oracle
+          path: coverage/oracle
+      - name: Generate coverage summary
+        if: always()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            // Ratchet policy: coverageThreshold is set just below current coverage; lower only with a docs/testing update.
+            const packages = [
+              { name: 'client', file: 'coverage/client/lcov.info', coverageThreshold: 80 },
+              { name: 'sdk', file: 'coverage/sdk/lcov.info', coverageThreshold: 80 },
+              { name: 'backend', file: 'coverage/backend/lcov.info', coverageThreshold: 70 },
+              { name: 'indexer', file: 'coverage/indexer/lcov.info', coverageThreshold: 50 },
+              { name: 'oracle', file: 'coverage/oracle/lcov.info', coverageThreshold: 70 }
+            ];
+            const rows = [];
+            let gateFailed = false;
+            for (const pkg of packages) {
+              const coverageFile = path.join(process.cwd(), pkg.file);
+              if (!fs.existsSync(coverageFile)) {
+                rows.push(`| ${pkg.name} | N/A | ${pkg.coverageThreshold}% | N/A |`);
+                continue;
+              }
+              const lcov = fs.readFileSync(coverageFile, 'utf8');
+              let found = 0;
+              let hit = 0;
+              for (const line of lcov.split('\n')) {
+                if (line.startsWith('LF:')) found += parseInt(line.slice(3), 10);
+                if (line.startsWith('LH:')) hit += parseInt(line.slice(3), 10);
+              }
+              const pct = found ? (hit / found) * 100 : 0;
+              const ok = pct >= pkg.coverageThreshold;
+              if (!ok) gateFailed = true;
+              rows.push(`| ${pkg.name} | ${pct.toFixed(2)}% | ${pkg.coverageThreshold}% | ${ok ? '✅' : '❌'} |`);
+            }
+            const table = `## Coverage\n\n| Package | Lines | Threshold | Status |\n| --- | ---: | ---: | --- |\n${rows.join('\n')}\n`;
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, table);
+            if (gateFailed) core.setFailed('Coverage is below the ratchet threshold in one or more packages.');
+      - name: Check all jobs status
+        run: |
+          check_status() {
+            if [[ "$1" != "success" && "$1" != "skipped" ]]; then
+              return 1
+            fi
+            return 0
+          }
+
+          if ! check_status "${{ needs.commitlint.result }}" || \
+             ! check_status "${{ needs.docs-policy.result }}" || \
+             ! check_status "${{ needs.turbo.result }}" || \
+             ! check_status "${{ needs.sdk.result }}" || \
+             ! check_status "${{ needs.backend.result }}" || \
+             ! check_status "${{ needs.indexer.result }}" || \
+             ! check_status "${{ needs.oracle.result }}" || \
+             ! check_status "${{ needs.compose-smoke.result }}" || \
+             ! check_status "${{ needs.observability.result }}" || \
+             ! check_status "${{ needs.security-scan.result }}" || \
+             ! check_status "${{ needs.lighthouse.result }}" || \
+             ! check_status "${{ needs.coverage-summary.result }}" || \
+             ! check_status "${{ needs.schema-drift.result }}"; then
+            echo "❌ One or more packages failed CI checks"
+            exit 1
+          fi
+          echo "✅ All CI checks passed"

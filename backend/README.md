@@ -1,0 +1,426 @@
+# Tikka Backend
+
+API layer that merges indexer data with Supabase metadata; handles auth (Sign In With Stellar), image storage, and notifications. Exposes REST (and later GraphQL) for the frontend and external consumers.
+
+**Stack:** NestJS, Fastify, Supabase, Redis.
+
+## Documentation
+
+- **[Environment variables](../docs/env/backend.md)** — backend settings, required values, and defaults
+- **[Request validation](../docs/backend/validation.md)** — global `ValidationPipe`, Zod schemas, DTO inventory, and endpoint checklist
+
+> **Note:** Package roots must contain only `README.md` and, if needed, `OPERATIONAL.md`; all other package-root docs have been moved to `docs/` or archived in `docs/archive/`.
+
+## Raffles API
+
+### GET /raffles
+
+List raffles with optional filters and pagination. Data comes from the indexer (contract state).
+
+| Query param | Type   | Description                       |
+| ----------- | ------ | --------------------------------- |
+| `status`    | string | Filter by raffle status           |
+| `category`  | string | Filter by category                |
+| `creator`   | string | Filter by creator Stellar address |
+| `asset`     | string | Filter by asset (e.g. XLM)        |
+| `limit`     | number | Page size (1–100, default 20)     |
+| `offset`    | number | Pagination offset (default 0)     |
+
+**Response:** `{ raffles: RaffleListItem[], total?: number }`
+
+### GET /raffles/:id
+
+Single raffle detail. Merges **indexer** (contract state: price, tickets, winner, status) and **Supabase** (metadata: title, description, image_url, category).
+
+**Response:** `RaffleDetailResponse` — contract fields + `title`, `description`, `image_url`, `category`
+
+### POST /raffles/:raffleId/metadata
+
+Create or update raffle metadata. Body: `{ title?, description?, image_url?, category?, metadata_cid? }`. **Requires JWT** (Bearer token from SIWS).
+
+## Auth (Sign In With Stellar — SIWS)
+
+Protected routes require `Authorization: Bearer <token>`.
+
+### Flow
+
+1. **GET /auth/nonce?address=G...** — Returns `{ nonce, expiresAt, issuedAt, message }`
+2. User signs the `message` in their Stellar wallet (Freighter, xBull, etc.)
+3. **POST /auth/verify** — Body: `{ address, signature, nonce [, issuedAt] }` where `signature` is base64-encoded Ed25519
+4. Returns `{ accessToken, refreshToken }` — use `accessToken` as `Authorization: Bearer <accessToken>`
+
+### Refresh Flow
+
+1. **POST /auth/refresh** — Body: `{ refreshToken }`
+2. Returns `{ accessToken, refreshToken }` (new pair, rotating the refresh token)
+
+### SIWS message format
+
+```
+tikka.io wants you to sign in
+Address: G...
+Nonce: abc123
+Issued At: 2025-02-19T12:00:00.000Z
+```
+
+Set `SIWS_DOMAIN` to customize the domain (default: `tikka.io`).
+
+### Manual check: protected route returns 401 without token
+
+```bash
+curl -X POST http://localhost:3001/raffles/1/metadata \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Test"}'
+# Expected: 401 Unauthorized
+```
+
+### Run e2e test
+
+```bash
+npm run test:e2e
+```
+
+## Rate Limiting
+
+All endpoints are protected against abuse. Limits are **per IP address**, enforced by `@nestjs/throttler`.  
+When a limit is exceeded the API returns **HTTP 429** with a `Retry-After` value in the response body.
+
+| Tier      | Endpoints                                                       | Default limit      |
+| --------- | --------------------------------------------------------------- | ------------------ |
+| `default` | All public API (`/raffles`, `/users`, `/leaderboard`, `/stats`) | **100 req / 60 s** |
+| `nonce`   | `GET /auth/nonce`                                               | **30 req / 60 s**  |
+| `auth`    | `POST /auth/verify`                                             | **10 req / 60 s**  |
+
+### 429 response body
+
+```json
+{
+  "statusCode": 429,
+  "error": "Too Many Requests",
+  "message": "Rate limit exceeded. Please slow down and try again.",
+  "retryAfter": 42
+}
+```
+
+### Configuring limits via env vars
+
+All thresholds are overridable without code changes (see `.env.example`):
+
+```dotenv
+THROTTLE_DEFAULT_LIMIT=100   # max requests per window
+THROTTLE_DEFAULT_TTL=60      # window size in seconds
+
+THROTTLE_AUTH_LIMIT=10       # POST /auth/verify
+THROTTLE_AUTH_TTL=60
+
+THROTTLE_NONCE_LIMIT=30      # GET /auth/nonce
+THROTTLE_NONCE_TTL=60
+```
+
+### Smoke-testing the rate limit
+
+```bash
+# Hit /auth/verify 11 times — the 11th must return 429
+for i in $(seq 1 11); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://localhost:3001/auth/verify
+done
+```
+
+---
+
+## Database migrations
+
+Entity ownership is documented in [../docs/database/ENTITY_OWNERSHIP.md](../docs/database/ENTITY_OWNERSHIP.md).
+The backend reads indexer-owned tables through a read-only role; grants are defined in the repository-level `db/baseline-schema.sql`.
+Backend code must not write to those tables, and dependency-cruiser blocks imports of `indexer/src/database/entities/*`.
+These restrictions are enforced by database grants and the dependency-cruiser import rule, not by documentation alone.
+
+The backend includes a migration validator that helps catch schema drift before deployment. Run it after adding or changing SQL migrations and before opening a pull request:
+
+```bash
+npm run migrations:check
+```
+
+What `migrations:check` verifies:
+- every migration file uses the `NNN_name.sql` naming pattern
+- sequence numbers are zero-padded to three digits
+- the sequence list is contiguous with no gaps
+- the name portion is valid `snake_case`
+
+When to run it:
+- after creating a new migration
+- after renaming or reordering migration files
+- before merging backend changes that touch the database schema
+
+How to create a migration correctly:
+1. add a new SQL file under `database/migrations/`
+2. use the next sequential number and a descriptive `snake_case` name, for example `database/migrations/023_add_support_feedback.sql`
+3. keep the filename format exactly `NNN_name.sql`
+4. run `npm run migrations:check` to confirm the numbering and naming are valid
+
+This prevents common failure modes such as skipped numbering, duplicate sequence values, invalid filenames, and drift between local migrations and deploy-time expectations.
+
+## Health Check
+
+### GET /health
+
+Returns the live status of all backend dependencies. No authentication required.
+
+```bash
+curl http://localhost:3001/health
+```
+
+**Response — all healthy (HTTP 200):**
+
+```json
+{
+  "status": "ok",
+  "indexer": "ok",
+  "supabase": "ok",
+  "timestamp": "2026-04-23T11:00:00.000Z"
+}
+```
+
+**Response — dependency down (HTTP 503):**
+
+```json
+{
+  "status": "degraded",
+  "indexer": "error",
+  "supabase": "ok",
+  "timestamp": "2026-04-23T11:00:00.000Z"
+}
+```
+
+| Field       | Values              | Description                                      |
+| ----------- | ------------------- | ------------------------------------------------ |
+| `status`    | `ok` / `degraded`   | Overall health — `degraded` if any check fails   |
+| `indexer`   | `ok` / `error`      | Reachability of tikka-indexer `/health`          |
+| `supabase`  | `ok` / `error`      | Reachability of Supabase REST endpoint           |
+| `timestamp` | ISO 8601 string     | Time the check was performed                     |
+
+The endpoint returns **HTTP 503** when `status` is `degraded`, so orchestrators (Kubernetes, Railway, Fly.io) can detect unhealthy instances automatically.
+
+---
+
+## Maintenance Mode
+
+Maintenance Mode allows administrators to temporarily block API traffic (or specific scopes) while keeping system health and monitoring endpoints reachable.
+
+### Toggling Maintenance Mode
+
+Maintenance mode can be toggled in three ways:
+
+1. **REST API (Dynamic Toggle at Runtime)**
+   - **`PUT /monitor/maintenance`** — Body: `{"enabled": true}` or `{"enabled": false}` (Requires Admin auth or bypass token).
+   - **`GET /monitor/maintenance`** — Returns `{"maintenanceMode": boolean}`.
+
+2. **Environment Variables (Startup Configuration)**
+   ```dotenv
+   MAINTENANCE_MODE=true              # Set to true to activate on startup
+   MAINTENANCE_SCOPES=all,writes      # Comma-separated list of scopes ('all', 'writes', 'raffles', 'notifications', 'monitor')
+   MAINTENANCE_BYPASS_TOKEN=secret    # Secret token to bypass maintenance mode via Authorization header
+   ```
+
+3. **Programmatic / Service Injection**
+   ```typescript
+   // Inject MaintenanceModeService into your controller or service
+   maintenanceModeService.setEnabled(true);  // Turn ON
+   maintenanceModeService.setEnabled(false); // Turn OFF
+   ```
+
+### Error Response Contract
+
+When maintenance mode is active and a non-exempt route is called, the API immediately rejects the request with:
+- **HTTP Status:** `503 Service Unavailable`
+- **HTTP Response Header:** `Retry-After: 60` (or configured retry duration in seconds)
+- **JSON Response Body:**
+  ```json
+  {
+    "statusCode": 503,
+    "error": "SERVICE_UNAVAILABLE",
+    "message": "Service temporarily unavailable due to maintenance mode",
+    "requestId": "req-12345",
+    "timestamp": "2026-07-27T17:15:00.000Z",
+    "path": "/api/v1/raffles"
+  }
+  ```
+
+### Exempt Routes & Bypass Token
+
+- **Exempt Routes (`@SkipMaintenance()`):**
+  Health checks (`GET /health`), cache metrics (`GET /metrics`), and maintenance status/toggle (`GET /monitor/maintenance`, `PUT /monitor/maintenance`, and `/monitor/*`) remain accessible so load balancers, orchestrators, and admin consoles can operate during maintenance.
+- **Bypass Token:**
+  Requests containing `Authorization: Bearer <MAINTENANCE_BYPASS_TOKEN>` will bypass maintenance checks and execute normally.
+
+---
+
+## Stellar network (Testnet / Mainnet)
+
+The backend selects a Stellar network with **`STELLAR_NETWORK`** (`testnet` or `mainnet`). That value drives:
+
+- **Horizon URL** — defaults to the public Horizon for the chosen network (`https://horizon-testnet.stellar.org` or `https://horizon.stellar.org`). Override with **`STELLAR_HORIZON_URL`** if you use a proxy or custom Horizon.
+- **Network passphrase** — exposed at runtime via `env.stellar.networkPassphrase` (same constants as the Stellar SDK) for any logic that must sign or verify against a specific network.
+- **Contract ID** — defaults are empty until you deploy; set **`STELLAR_CONTRACT_ID`** to your raffle (or other) contract for the environment you are running.
+- **Indexer base URL** — if **`INDEXER_URL`** is not set, it defaults to the URL in `stellar.constants.ts` for that network (currently `http://localhost:3002` for both). In production, set **`INDEXER_URL`** explicitly to the tikka-indexer instance that indexes the same chain as **`STELLAR_NETWORK`**.
+
+Injectable services should read **`INDEXER_URL`** and **`INDEXER_TIMEOUT_MS`** from Nest **`ConfigService`** (validated at startup). For scripts or non-DI code, use **`env.indexer`** and **`env.stellar`** from `src/config/env.config.ts`.
+
+Example `.env` fragments:
+
+```dotenv
+# Local development against testnet
+STELLAR_NETWORK=testnet
+INDEXER_URL=http://localhost:3002
+
+# Production-style: mainnet Horizon defaults; point indexer at your fleet
+STELLAR_NETWORK=mainnet
+STELLAR_CONTRACT_ID=YOUR_MAINNET_CONTRACT_ID
+INDEXER_URL=https://your-indexer.example.com
+```
+
+---
+
+## Environment Variables
+
+Copy `.env.example` to `.env` and fill in the required values before starting the server.
+
+```bash
+cp .env.example .env
+```
+
+The app validates all variables at startup using Zod. Missing or invalid required vars cause an immediate startup failure with a clear error message listing every invalid field.
+
+### Required
+
+These must be set or the app will refuse to start:
+
+| Variable                   | Description                                                  |
+| -------------------------- | ------------------------------------------------------------ |
+| `SUPABASE_URL`             | Full URL of your Supabase project (e.g. `https://xyz.supabase.co`) |
+| `SUPABASE_SERVICE_ROLE_KEY`| Supabase service role key (not the anon key)                 |
+| `JWT_SECRET`               | Secret for signing JWTs — **minimum 32 characters**          |
+| `VITE_FRONTEND_URL`        | Frontend origin allowed by CORS (e.g. `https://app.tikka.io`) |
+| `ADMIN_TOKEN`              | Bearer token for `/admin/*` endpoints                        |
+
+### Optional (with defaults)
+
+| Variable                   | Default                    | Description                                      |
+| -------------------------- | -------------------------- | ------------------------------------------------ |
+| `PORT`                     | `3001`                     | HTTP port the server listens on                  |
+| `STELLAR_NETWORK`          | `testnet`                  | `testnet` or `mainnet` — Horizon, contract, and default indexer base |
+| `STELLAR_HORIZON_URL`      | (from network)             | Override Horizon URL (optional)                  |
+| `STELLAR_CONTRACT_ID`     | (none)                     | On-chain contract id for this deployment (optional) |
+| `INDEXER_URL`              | (per `STELLAR_NETWORK`)    | Base URL of tikka-indexer; set explicitly in prod |
+| `INDEXER_TIMEOUT_MS`       | `5000`                     | HTTP timeout for indexer requests (ms)           |
+| `JWT_EXPIRES_IN`           | `7d`                       | JWT expiry duration (e.g. `1h`, `7d`)            |
+| `SIWS_DOMAIN`              | `tikka.io`                 | Domain shown in the SIWS sign-in message         |
+| `ADMIN_IP_ALLOWLIST`       | `""` (allow all)           | Comma-separated CIDRs/IPs for admin access       |
+| `FCM_ENABLED`              | `false`                    | Enable Firebase Cloud Messaging push notifications |
+| `FCM_SERVICE_ACCOUNT_JSON` | —                          | FCM service account JSON string (for CI/secrets) |
+| `FCM_SERVICE_ACCOUNT_PATH` | —                          | Path to FCM service account JSON file            |
+| `THROTTLE_DEFAULT_LIMIT`   | `100`                      | Max requests per window for public endpoints     |
+| `THROTTLE_DEFAULT_TTL`     | `60`                       | Rate-limit window size in seconds                |
+| `THROTTLE_AUTH_LIMIT`      | `10`                       | Max requests per window for `POST /auth/verify`  |
+| `THROTTLE_AUTH_TTL`        | `60`                       | Rate-limit window for auth tier (seconds)        |
+| `THROTTLE_NONCE_LIMIT`     | `30`                       | Max requests per window for `GET /auth/nonce`    |
+| `THROTTLE_NONCE_TTL`       | `60`                       | Rate-limit window for nonce tier (seconds)       |
+
+---
+
+## Structure
+
+- `src/api/rest/` - raffles, users, leaderboard, stats, search, notifications
+- `src/auth/` - SIWS (nonce, verify), JWT strategy, guards
+- `src/services/` - metadata, storage, indexer client, notifications, search
+- `src/middleware/` - rate limit, validation (Zod), CORS
+- `src/config/` - env configuration
+
+## Architecture
+
+Full ecosystem spec: [../docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) (section 4 - tikka-backend).
+
+## Image upload endpoint
+
+- `POST /raffles/upload-image`
+- Auth: Bearer token required
+- Content type: `multipart/form-data`
+- File field: first uploaded file part
+- Optional field: `raffleId` (used in storage path)
+- Response: `{ "url": "https://..." }`
+
+### Upload limits
+
+- Max file size: `5 MB` (`5242880` bytes)
+- Allowed MIME types: `image/jpeg`, `image/png`, `image/webp`
+
+### Required environment variables
+
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+## Resource Guidelines
+- **CPU**: 100m requests, 500m limits
+- **Memory**: 256Mi requests, 512Mi limits
+These resources are managed by HPA targeting 70% CPU usage.
+---
+
+## Database Backups & Restore
+
+Data persistence in Supabase is critical. We use a multi-layered backup strategy.
+
+### 1. Automated Backups (GitHub Actions)
+
+A GitHub Action (`.github/workflows/supabase-backup.yml`) runs daily at 02:00 UTC.
+- **Process:** Runs `pg_dump`, compresses to `.sql.gz`, and uploads to **Cloudflare R2**.
+- **Retention:** Backups are retained for 30 days.
+- **Trigger:** Can be manually triggered via GitHub Actions tab.
+
+**Required Secrets:**
+- `SUPABASE_DB_URL`: Full Postgres URI.
+- `R2_BUCKET_NAME`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT_URL`.
+
+### 2. Manual Local Backups
+
+Use the provided script for local dumps before migrations or major changes.
+
+```bash
+# Set your DB URL (or add to .env)
+export SUPABASE_DB_URL="postgresql://postgres:<pwd>@db.<ref>.supabase.co:5432/postgres"
+
+# Run the backup script
+bash scripts/backup.sh
+```
+
+- **Output:** `backups/tikka-backup-YYYY-MM-DD-HHmmss.dump` (Postgres custom format).
+- **Upload:** Optionally uploads to R2 if credentials are set in `.env`.
+
+### 3. Point-in-Time Recovery (PITR)
+
+For production environments, ensure **Supabase PITR** is enabled in the dashboard:
+- Go to **Settings** -> **Database** -> **Backups**.
+- Enable PITR (requires Pro plan or higher).
+
+### 4. Restore Process
+
+#### From a Local `.dump` file (Custom Format)
+The custom format is recommended as it allows selective restores and is compressed.
+
+```bash
+pg_restore \
+  --dbname=$SUPABASE_DB_URL \
+  --no-owner --no-acl \
+  --schema=public \
+  --verbose \
+  backups/tikka-backup-TIMESTAMP.dump
+```
+
+#### From a `.sql.gz` file (Plain Text)
+Used by the automated GitHub workflow.
+
+```bash
+gunzip -c tikka-backup-TIMESTAMP.sql.gz | psql $SUPABASE_DB_URL
+```
+
+> [!CAUTION]
+> Restoring a database can overwrite existing data. Always verify the backup and the target environment before proceeding.

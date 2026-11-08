@@ -1,0 +1,31 @@
+{
+  "plugin": ["typedoc-plugin-markdown"],
+  "entryPoints": ["src/index.ts", "src/index.read.ts", "src/index.write.ts"],
+  "entryPointStrategy": "resolve",
+  "out": "./docs",
+  "name": "Tikka SDK",
+  "readme": "README.md",
+  "includeVersion": true,
+  "categorizeByGroup": true,
+  "groupOrder": [
+    "Raffle",
+    "Ticket",
+    "User",
+    "Admin",
+    "Wallet",
+    "Network",
+    "Fee",
+    "Utils",
+    "*"
+  ],
+  "excludeProtected": true,
+  "excludeInternal": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/crackedstudio/tikka"
+  },
+  "exclude": ["**/*.spec.ts", "**/test/**", "**/node_modules/**", "**/dist/**"],
+  "excludePrivate": true,
+  "excludeExternals": true,
+  "skipErrorChecking": true,
+  "tsconfig": "./tsconfig.json"
+}

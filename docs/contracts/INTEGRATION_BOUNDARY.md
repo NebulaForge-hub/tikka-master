@@ -1,0 +1,677 @@
+# Soroban Contract Integration Boundary
+
+> **Scope:** External Soroban contracts for the Tikka raffle platform  
+> **Audience:** SDK, indexer, oracle, backend, and client developers  
+> **Status:** Living document â€” update after each contract deployment
+
+---
+
+## Overview
+
+Tikka integrates with two primary Soroban contracts deployed on the Stellar network:
+
+1. **Raffle Contract** â€” Core raffle state machine, ticket sales, winner selection
+2. **Factory Contract** (optional) â€” Deploy new raffle instances
+
+These contracts are **external to this repository** and define the boundary conditions that all SDK, indexer, oracle, backend, and client code must respect.
+
+---
+
+## Required Contract IDs
+
+Contract addresses vary by network. All are configured via environment variables or SDK defaults.
+
+### Raffle Contract
+
+| Network        | Env Var                     | Testnet Default                                            | Mainnet Default                  |
+| -------------- | --------------------------- | ---------------------------------------------------------- | -------------------------------- |
+| **Testnet**    | `TIKKA_CONTRACT_TESTNET`    | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` | N/A                              |
+| **Mainnet**    | `TIKKA_CONTRACT_MAINNET`    | N/A                                                        | (empty â€” set after deployment) |
+| **Standalone** | `TIKKA_CONTRACT_STANDALONE` | (empty â€” local dev)                                      | N/A                              |
+
+**Source:** [`sdk/src/contract/constants.ts`](../../sdk/src/contract/constants.ts)
+
+### Factory Contract (optional)
+
+| Network        | Env Var                    | Purpose                                |
+| -------------- | -------------------------- | -------------------------------------- |
+| **Testnet**    | `TIKKA_FACTORY_TESTNET`    | Deploy new raffle instances on testnet |
+| **Mainnet**    | `TIKKA_FACTORY_MAINNET`    | Deploy new raffle instances on mainnet |
+| **Standalone** | `TIKKA_FACTORY_STANDALONE` | Deploy new raffle instances locally    |
+
+---
+
+## Contract Interface
+
+### Core Methods
+
+All method names must exactly match the Rust `pub fn` declarations in the contract. Changing a method name or signature breaks compatibility.
+
+#### Lifecycle Methods
+
+| Method                   | Parameters                                            | Returns                 | Role                                                       |
+| ------------------------ | ----------------------------------------------------- | ----------------------- | ---------------------------------------------------------- |
+| **`create_raffle`**      | `params: RaffleParams`                                | `u32` (raffle_id)       | Create a new raffle, emit `RaffleCreated`                  |
+| **`buy_ticket`**         | `raffle_id: u32, buyer: Address, qty: u32`            | `Vec<u32>` (ticket_ids) | Purchase one or more tickets, emit `TicketPurchased`       |
+| **`trigger_draw`**       | `raffle_id: u32`                                      | â€”                     | Transition raffle to `DRAWING` state, emit `DrawTriggered` |
+| **`receive_randomness`** | `raffle_id: u32, seed: BytesN<32>, proof: BytesN<64>` | â€”                     | Accept oracle-provided randomness, finalize raffle         |
+| **`cancel_raffle`**      | `raffle_id: u32`                                      | â€”                     | Cancel raffle and allow refunds                            |
+| **`refund_ticket`**      | `raffle_id: u32, ticket_id: u32`                      | â€”                     | Refund a single ticket (only if cancelled)                 |
+
+**Source:** [`sdk/src/contract/bindings.ts`](../../sdk/src/contract/bindings.ts)
+
+#### Query Methods (Read-Only, No Signing)
+
+| Method                       | Parameters                      | Returns             | Role                                            |
+| ---------------------------- | ------------------------------- | ------------------- | ----------------------------------------------- |
+| **`get_raffle_data`**        | `raffle_id: u32`                | `RaffleData`        | Fetch raffle state, params, and status          |
+| **`get_active_raffle_ids`**  | â€”                             | `Vec<u32>`          | List raffle IDs in `OPEN` or `DRAWING` state    |
+| **`get_all_raffle_ids`**     | â€”                             | `Vec<u32>`          | List all raffle IDs (all states)                |
+| **`get_user_tickets`**       | `raffle_id: u32, user: Address` | `Vec<u32>`          | Get ticket IDs owned by a user in a raffle      |
+| **`get_user_participation`** | `user: Address`                 | `UserParticipation` | Get user's participation summary across raffles |
+
+#### Admin Methods (Require Authorization)
+
+| Method                   | Parameters           | Returns   | Signer             |
+| ------------------------ | -------------------- | --------- | ------------------ |
+| **`set_oracle_address`** | `oracle: Address`    | â€”       | Admin only         |
+| **`set_protocol_fee`**   | `fee_bps: u32`       | â€”       | Admin only         |
+| **`withdraw_fees`**      | `recipient: Address` | â€”       | Admin only         |
+| **`pause`**              | â€”                  | â€”       | Admin only         |
+| **`unpause`**            | â€”                  | â€”       | Admin only         |
+| **`transfer_admin`**     | `new_admin: Address` | â€”       | Current admin only |
+| **`accept_admin`**       | â€”                  | â€”       | Pending admin only |
+| **`get_admin`**          | â€”                  | `Address` | Any (read-only)    |
+| **`is_paused`**          | â€”                  | `bool`    | Any (read-only)    |
+
+---
+
+## Data Schemas
+
+### Raffle States
+
+All raffles exist in one of four states:
+
+```rust
+enum RaffleStatus {
+  Open = 0,      // Accepting ticket purchases
+  Drawing = 1,   // Waiting for oracle randomness
+  Finalized = 2, // Winner selected, prizes claimable
+  Cancelled = 3, // No longer accepting tickets, refunds allowed
+}
+```
+
+**State Transitions:**
+
+```
+OPEN  â”€â”€(end_time passed)â”€â”€â–¶  DRAWING  â”€â”€(oracle reveals)â”€â”€â–¶  FINALIZED
+  â”‚                                                               â–²
+  â””â”€â”€â”€â”€â”€â”€â”€(host cancels / min not met)â”€â”€â”€â”€â–¶  CANCELLED â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
+```
+
+**Allowed Actions per State:**
+
+| State       | Allowed                                         | Blocked                                         |
+| ----------- | ----------------------------------------------- | ----------------------------------------------- |
+| `OPEN`      | `buy_ticket` / `trigger_draw` / `cancel_raffle` | `receive_randomness`                            |
+| `DRAWING`   | `receive_randomness` / `cancel_raffle`          | `buy_ticket`                                    |
+| `FINALIZED` | `get_raffle_data`                               | `buy_ticket` / `cancel_raffle` / `trigger_draw` |
+| `CANCELLED` | `refund_ticket`                                 | all others                                      |
+
+**Terminal states:** `FINALIZED` and `CANCELLED` are terminal — no transition
+leaves them. This matters for identifier allocation; see
+[Raffle ID Allocation](#raffle-id-allocation) below.
+
+### Raffle ID Allocation
+
+`create_raffle` returns a `u32` raffle ID. IDs are drawn from a single
+monotonically increasing counter held in the contract's instance storage
+(`storage::next_raffle_id` in the contract source).
+
+#### Guarantee: an issued raffle ID is never reused
+
+**A raffle ID that has been issued is never issued again.** The counter is
+advanced only by allocation; nothing else — in particular no lifecycle
+transition — ever decrements it, resets it, or frees a slot. Concretely:
+
+| Event                              | Effect on the ID counter | Is the ID ever reissued? |
+| ---------------------------------- | ------------------------ | ------------------------ |
+| `create_raffle`                    | `+1`                     | No                       |
+| `buy_ticket`                       | unchanged                | No                       |
+| `trigger_draw`                     | unchanged                | No                       |
+| `receive_randomness` → `FINALIZED` | unchanged                | No                       |
+| `cancel_raffle` → `CANCELLED`      | unchanged                | No                       |
+| `refund_ticket`                    | unchanged                | No                       |
+| `claim_prize`                      | unchanged                | No                       |
+| Contract upgrade                   | unchanged                | No                       |
+
+Terminating a raffle **retires** its ID; it does not release it. A cancelled
+raffle's ID stays bound to that cancelled raffle forever, and is never handed to
+a different raffle.
+
+**Integrators may therefore cache against a raffle ID.** Because a live ID can
+never be reassigned, any cached value keyed by `raffle_id` — including cached
+terminal-state facts such as "this raffle is cancelled" — cannot go stale against
+an unrelated raffle. There is no need to evict terminated IDs, and no need to
+treat a re-read of a cached ID as potentially belonging to someone else.
+
+#### Ordering
+
+Within a single contract instance, IDs are issued in increasing order with no
+gaps: a larger ID always corresponds to a later `create_raffle`. An ID from
+another contract instance (a redeploy, or a different network) is a different
+namespace and carries no ordering relationship — scope any cached ID by contract
+ID as well as network.
+
+#### Query method implications
+
+| Method                  | Includes terminated IDs?                      |
+| ----------------------- | --------------------------------------------- |
+| `get_all_raffle_ids`    | Yes — every ID ever issued, in issuance order |
+| `get_active_raffle_ids` | No — only `OPEN` and `DRAWING`                |
+
+`get_active_raffle_ids` is therefore _not_ an allocation cursor: IDs missing
+from it have been issued, not skipped. Use `get_all_raffle_ids` (or
+`get_raffle_data`) to confirm that an ID exists.
+
+#### Exhaustion
+
+The ID space is `1 .. u32::MAX` — 4,294,967,295 IDs per contract instance. `0`
+is reserved to mean "no raffle". When the counter has issued `u32::MAX`,
+`create_raffle` fails and **does not wrap**: it never resets to `1` and never
+reuses a previously issued ID.
+
+| Property                | Value                                                         |
+| ----------------------- | ------------------------------------------------------------- |
+| Contract error          | `RaffleIdExhausted`                                           |
+| Soroban panic code      | `6`                                                           |
+| SDK error code          | `RAFFLE_ID_EXHAUSTED` (`TikkaSdkErrorCode.RaffleIdExhausted`) |
+| SDK error class         | `RaffleIdExhaustedError`                                      |
+| SDK `ContractErrorType` | `RAFFLE_ID_EXHAUSTED`                                         |
+| Retryable               | No — treat as terminal for ID creation                        |
+
+The SDK surfaces this as a distinct error type, so callers can branch on the
+type rather than parsing messages:
+
+```typescript
+import { RaffleIdExhaustedError } from '@tikka/sdk';
+
+try {
+  await raffleService.create(params);
+} catch (err) {
+  if (err instanceof RaffleIdExhaustedError) {
+    // The u32 ID space for this contract instance is spent. Deploy a new
+    // contract instance rather than retrying.
+  }
+}
+```
+
+#### Holds across contract upgrades
+
+The counter lives in persistent instance storage, so the guarantee is an
+invariant across every contract upgrade: an upgraded contract resumes the
+sequence from the persisted counter, never restarting at `1` and never
+reissuing an ID. Preserving the allocation counter is a hard requirement of any
+upgrade — an upgrade that resets or reseeds the counter would violate this
+guarantee and is a breaking change. See
+[CONTRACT_UPGRADE_CHECKLIST.md](./CONTRACT_UPGRADE_CHECKLIST.md).
+
+#### Executable reference
+
+The allocation rules above are mirrored by an executable model in the SDK, so
+integrators and CI can assert against them without a chain:
+
+- Model: [`sdk/src/contract/raffle-id-allocation.ts`](../../sdk/src/contract/raffle-id-allocation.ts)
+- Tests: [`sdk/src/contract/raffle-id-allocation.spec.ts`](../../sdk/src/contract/raffle-id-allocation.spec.ts)
+
+```bash
+cd sdk && pnpm test -- raffle-id-allocation
+```
+
+### RaffleData Struct
+
+```rust
+pub struct RaffleData {
+    pub id: u32,
+    pub creator: Address,
+    pub status: RaffleStatus,
+    pub params: RaffleParams,
+    pub ticket_count: u32,
+    pub total_raised: i128,
+    pub winner: Option<Address>,
+    pub winning_ticket_id: Option<u32>,
+    pub prize_amount: i128,
+    pub created_ledger: u32,
+    pub end_time: u64,
+    pub metadata_uri: String,
+}
+```
+
+### RaffleParams Struct
+
+```rust
+pub struct RaffleParams {
+    pub name: String,
+    pub description: String,
+    pub ticket_price: i128,        // In stroops (1 XLM = 10,000,000 stroops)
+    pub min_tickets_sold: u32,
+    pub max_tickets: u32,
+    pub end_time: u64,             // Ledger timestamp (Unix seconds)
+    pub token_address: Address,    // SEP-41 token (usually native XLM)
+    pub metadata_uri: String,      // IPFS or HTTP URL to raffle metadata
+}
+```
+
+### UserParticipation Struct
+
+```rust
+pub struct UserParticipation {
+    pub user: Address,
+    pub raffle_ids: Vec<u32>,
+    pub total_spent: i128,
+    pub tickets_owned: u32,
+    pub raffles_won: u32,
+}
+```
+
+---
+
+## Contract Events
+
+Events are emitted on the Stellar ledger and indexed by the `tikka-indexer`. Event names and field names must match exactly for parsing to work.
+
+### RaffleCreated
+
+Emitted when a new raffle is created.
+
+```rust
+RaffleCreated {
+    raffle_id: u32,
+    creator: Address,
+    ticket_price: i128,
+    max_tickets: u32,
+    end_time: u64,
+}
+```
+
+**Indexed by:** `raffle.created` event handler  
+**Parsed to:** Database `raffles` table  
+**Used by:** Frontend to display new raffles
+
+### TicketPurchased
+
+Emitted when one or more tickets are purchased.
+
+```rust
+TicketPurchased {
+    raffle_id: u32,
+    buyer: Address,
+    ticket_ids: Vec<u32>,
+    total_paid: i128,
+}
+```
+
+**Indexed by:** `ticket.purchased` event handler  
+**Parsed to:** Database `tickets` and `raffle_metrics` tables  
+**Used by:** Backend to track sales, update raffle status
+
+### DrawTriggered
+
+Emitted when the raffle is transitioned to `DRAWING` state.
+
+```rust
+DrawTriggered {
+    raffle_id: u32,
+    triggered_at_ledger: u32,
+}
+```
+
+**Indexed by:** `raffle.draw_triggered` event handler  
+**Parsed to:** Database `raffles` table (status â†’ DRAWING)  
+**Used by:** Oracle to detect which raffles need randomness
+
+### RandomnessRequested
+
+Emitted when the contract requests randomness from the oracle.
+
+```rust
+RandomnessRequested {
+    raffle_id: u32,
+    request_id: u32,
+}
+```
+
+**Indexed by:** Oracle event listener  
+**Parsed to:** Oracle worker queue  
+**Used by:** Oracle to compute randomness and callback
+
+### RandomnessReceived
+
+Emitted when randomness is successfully received and verified.
+
+```rust
+RandomnessReceived {
+    raffle_id: u32,
+    seed: BytesN<32>,
+    proof: BytesN<64>,
+}
+```
+
+**Indexed by:** `raffle.randomness_received` event handler  
+**Parsed to:** Database `raffles` table (randomness verified)  
+**Used by:** Frontend to detect raffle finalization
+
+### RaffleFinalized
+
+Emitted when a winner is selected and raffle moves to `FINALIZED` state.
+
+```rust
+RaffleFinalized {
+    raffle_id: u32,
+    winner: Address,
+    winning_ticket_id: u32,
+    prize_amount: i128,
+}
+```
+
+**Indexed by:** `raffle.finalized` event handler  
+**Parsed to:** Database `raffles` table, send winner notification  
+**Used by:** Backend to notify winner, frontend to display results
+
+### RaffleCancelled
+
+Emitted when a raffle is cancelled and moved to `CANCELLED` state.
+
+```rust
+RaffleCancelled {
+    raffle_id: u32,
+    reason: String,
+}
+```
+
+**Indexed by:** `raffle.cancelled` event handler  
+**Parsed to:** Database `raffles` table (status â†’ CANCELLED)  
+**Used by:** Frontend to display cancellation, backend to notify participants
+
+### TicketRefunded
+
+Emitted when a ticket is refunded (after cancellation).
+
+```rust
+TicketRefunded {
+    raffle_id: u32,
+    ticket_id: u32,
+    recipient: Address,
+    amount: i128,
+}
+```
+
+**Indexed by:** `ticket.refunded` event handler  
+**Parsed to:** Database `transactions` table  
+**Used by:** Frontend to show refund status
+
+---
+
+## Network Configuration
+
+### Stellar Networks
+
+Tikka supports three Stellar networks:
+
+| Network        | RPC Endpoint                          | Horizon                               | Use Case                                  |
+| -------------- | ------------------------------------- | ------------------------------------- | ----------------------------------------- |
+| **Testnet**    | `https://soroban-testnet.stellar.org` | `https://horizon-testnet.stellar.org` | Development, QA, smoke tests              |
+| **Mainnet**    | `https://soroban-mainnet.stellar.org` | `https://horizon.stellar.org`         | Production, real users, real transactions |
+| **Standalone** | `http://localhost:8000`               | `http://localhost:8000`               | Local development, integration tests      |
+
+**Source:** [`sdk/src/network/network.config.ts`](../../sdk/src/network/network.config.ts)
+
+### Network Passphrase
+
+Each network has a unique passphrase used for transaction signing:
+
+| Network        | Passphrase                                       |
+| -------------- | ------------------------------------------------ |
+| **Testnet**    | `Test SDF Network ; September 2015`              |
+| **Mainnet**    | `Public Global Stellar Network ; September 2015` |
+| **Standalone** | `Standalone Network ; February 2021`             |
+
+**Critical:** Must match contract's network. Using wrong passphrase â†’ invalid signatures.
+
+---
+
+## Integration Points
+
+This section links the contract to specific code locations that depend on it.
+
+### SDK Bindings
+
+**Location:** [`sdk/src/contract/bindings.ts`](../../sdk/src/contract/bindings.ts)
+
+- Defines `ContractFn` enum (all method names)
+- Defines `ContractFnName` type for type-safe method calls
+- Defines `RaffleStatus` enum (matches contract states)
+- Auto-generated from contract ABI via `stellar contract bindings typescript`
+
+**On Contract Update:**
+
+- Regenerate bindings with:
+  ```bash
+  stellar contract bindings typescript \
+    --network testnet \
+    --contract-id <NEW_CONTRACT_ID> \
+    --output-dir ./sdk/src/contract/generated
+  ```
+
+### SDK Contract Service
+
+**Location:** [`sdk/src/contract/contract.service.ts`](../../sdk/src/contract/contract.service.ts)
+
+- Invokes contract methods via `simulateReadOnly()` and `invoke()`
+- Handles fee estimation, auth, and XDR serialization
+- Returns typed `ContractResponse<T>`
+
+**On Contract Update:**
+
+- Update `ContractFn` calls if method names changed
+- Adjust parameter types if `RaffleParams` or other structs changed
+
+### Indexer Event Parser
+
+**Location:** [`indexer/src/ingestor/event-handler-registry.service.ts`](../../indexer/src/ingestor/event-handler-registry.service.ts)  
+**Handlers:** [`indexer/src/ingestor/handlers/`](../../indexer/src/ingestor/handlers/)
+
+- Registers handlers for each contract event type
+- Each handler implements `IEventHandler` and parses `RawSorobanEvent` to typed domain events
+- Persists parsed events to PostgreSQL
+
+**Event Handlers:**
+
+- `RaffleCreatedHandler` â†’ parses `RaffleCreated` event
+- `TicketPurchasedHandler` â†’ parses `TicketPurchased` event
+- `DrawTriggeredHandler` â†’ parses `DrawTriggered` event
+- `RaffleFinalized` â†’ parses `RaffleFinalized` event
+- (More in `handlers/index.ts`)
+
+**On Contract Update:**
+
+- If event fields change, update the corresponding handler's `parse()` method
+- If new events added, create new handler class and register in registry
+- See [`indexer/src/ingestor/EVENT_PARSER.md`](../../indexer/src/ingestor/EVENT_PARSER.md)
+
+### Oracle Event Listener
+
+**Location:** [`oracle/src/listener/event-listener.ts`](../../oracle/src/listener/)
+
+- Subscribes to `RandomnessRequested` events
+- Queues raffle IDs for randomness computation
+
+**On Contract Update:**
+
+- If `RandomnessRequested` event signature changes, update listener
+- If oracle callback method name changes (currently `receive_randomness`), update `TxSubmitter`
+
+### Backend Contract Integration
+
+**Location:** [`backend/src/contract/`](../../backend/src/contract/)
+
+- Metadata storage (raffle name, description, image URL)
+- Tracks on-chain state without redundancy
+- Mirrors indexer data for API queries
+
+**On Contract Update:**
+
+- Check if contract events include new fields that should be in `raffle_metadata` table
+- Update database schema if new fields needed
+
+### Client Contract Integration
+
+**Location:** [`client/src/config/contract.ts`](../../client/src/config/contract.ts)  
+**Hooks:** [`client/src/hooks/useContract.ts`](../../client/src/hooks/useContract.ts)
+
+- Stores contract address and method names
+- `useContract()` hook wraps SDK calls
+- Displays contract state in UI (status, ticket count, prize, etc.)
+
+**On Contract Update:**
+
+- Update method names in `CONTRACT_CONFIG.functions`
+- Update `RaffleStatus` enum if states changed
+- Update UI to reflect new contract capabilities
+
+---
+
+## Compatibility Verification
+
+Before deploying a contract upgrade, verify compatibility across all packages.
+
+### Pre-Deployment Checklist
+
+See **[CONTRACT_UPGRADE_CHECKLIST.md](./CONTRACT_UPGRADE_CHECKLIST.md)** for the full list.
+
+**Quick Check:**
+
+```bash
+# 1. Generate new SDK bindings
+cd sdk
+stellar contract bindings typescript --network testnet --contract-id <NEW_ID>
+
+# 2. Update constants
+# Edit sdk/src/contract/constants.ts with new contract ID
+
+# 3. Run SDK tests
+npm run test
+
+# 4. Check indexer event parser still compiles
+cd ../indexer
+npm run lint
+
+# 5. Verify oracle can call new receive_randomness method
+cd ../oracle
+npm run lint
+
+# 6. Check backend can fetch contract data
+cd ../backend
+npm run lint
+
+# 7. Update client contract config
+cd ../client
+npm run build
+```
+
+If all pass, contract upgrade is safe.
+
+---
+
+## Troubleshooting
+
+### Contract Not Found
+
+**Error:** `Raffle contract address not configured for network "testnet"`
+
+**Fix:**
+
+1. Check `TIKKA_CONTRACT_TESTNET` env var is set
+2. Verify contract is deployed on the network
+3. Check contract ID is valid (matches Soroban ledger)
+
+### Method Not Found
+
+**Error:** `Method "create_raffle_v2" not found on contract`
+
+**Fix:**
+
+1. Contract method name may have changed
+2. Check contract source for correct method name
+3. Regenerate SDK bindings
+4. Update all code referencing old method name
+
+### Event Parse Failure
+
+**Error:** `Failed to parse RaffleCreated: missing data`
+
+**Fix:**
+
+1. Check event field names in contract `events.rs`
+2. Update indexer event handler with new field order
+3. Re-run indexer from contract deployment block
+
+### State Transition Invalid
+
+**Error:** `Cannot buy ticket on raffle in FINALIZED state`
+
+**Fix:**
+
+1. Check raffle status in contract â€” may be cached
+2. Call `get_raffle_data(raffle_id)` to refresh state
+3. Verify event was indexed correctly (check indexer logs)
+
+### Raffle ID Space Exhausted
+
+**Error:** `create_raffle` fails with contract error `RaffleIdExhausted` (panic code `6`) / SDK `RaffleIdExhaustedError` (`RAFFLE_ID_EXHAUSTED`)
+
+**Fix:**
+
+1. Do not retry — the `u32` ID counter has issued every ID and will not wrap
+2. This is not a bug: IDs are never reused, so there is no ID left to hand out
+3. Deploy a new contract instance (a fresh counter starts at `1`) and point `TIKKA_CONTRACT_*` at it
+4. Confirm the counter really is at the ceiling rather than corrupted by an upgrade — see [Raffle ID Allocation](#raffle-id-allocation)
+
+---
+
+## Related Documentation
+
+- **[CONTRACT_UPGRADE_CHECKLIST.md](./CONTRACT_UPGRADE_CHECKLIST.md)** â€” Step-by-step upgrade guide
+- **[SCHEMA_VERIFICATION.md](./SCHEMA_VERIFICATION.md)** â€” How to verify contract data compatibility
+- **[ARCHITECTURE.md](../ARCHITECTURE.md)** â€” System-wide architecture (section 1: tikka-contracts)
+- **[EVENT_PARSER.md](../../indexer/src/ingestor/EVENT_PARSER.md)** â€” How indexer parses events
+- **[SDK README](../../sdk/README.md)** â€” SDK usage guide
+- **[Stellar Soroban Docs](https://developers.stellar.org/learn/smart-contracts)** â€” Official Soroban reference
+
+---
+
+## FAQ
+
+**Q: Can I deploy a new contract without updating the SDK?**  
+**A:** Only if method names and signatures don't change. If they do, you must regenerate bindings and update all call sites.
+
+**Q: What happens if event field names change?**  
+**A:** The indexer event parser will fail to extract the field. Events won't be indexed. Update the handler immediately.
+
+**Q: Can I add a new method to the contract?**  
+**A:** Yes, as long as you don't change existing method signatures. Add the new method name to `ContractFn` in the SDK and call sites.
+
+**Q: Do I need to update the Oracle when the contract changes?**  
+**A:** Only if the `receive_randomness` method signature changes, or if randomness request/response events change.
+
+**Q: How often do contract deployments happen?**  
+**A:** Typically after major feature work or bug fixes. Announced in `CHANGELOG.md` and pinned in Discord.
+
+**Q: Is a raffle ID ever reused after its raffle is cancelled or finalized?**  
+**A:** No. Raffle IDs come from a single monotonic `u32` counter and are never reused — a terminal transition retires the ID rather than releasing it, and the guarantee also holds across contract upgrades. Safe to cache against a `raffle_id`. See [Raffle ID Allocation](#raffle-id-allocation).
+
+**Q: A raffle ID is missing from `get_active_raffle_ids`. Was it skipped?**  
+**A:** No. It was issued — it belongs to a raffle that has reached a terminal state (`FINALIZED` / `CANCELLED`). Use `get_all_raffle_ids` to enumerate every issued ID.
+
+**Q: What happens when the raffle ID space runs out?**  
+**A:** `create_raffle` fails with the named `RaffleIdExhausted` error (Soroban panic code `6`, SDK code `RAFFLE_ID_EXHAUSTED` / `RaffleIdExhaustedError`). The counter does not wrap. Deploy a new contract instance rather than retrying.

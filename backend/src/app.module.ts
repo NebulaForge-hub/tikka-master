@@ -1,0 +1,168 @@
+
+import { MiddlewareConsumer, Module, NestModule } from "@nestjs/common";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { APP_GUARD, APP_INTERCEPTOR } from "@nestjs/core";
+import { ThrottlerModule, seconds } from "@nestjs/throttler";
+import { LoggerModule } from "nestjs-pino";
+import { BullModule } from "@nestjs/bullmq";
+import { AuthModule } from "./auth/auth.module";
+import { JwtAuthGuard } from "./auth/guards/jwt-auth.guard";
+import { RafflesModule } from "./api/rest/raffles/raffles.module";
+import { UsersModule } from "./api/rest/users/users.module";
+import { LeaderboardModule } from "./api/rest/leaderboard/leaderboard.module";
+import { StatsModule } from "./api/rest/stats/stats.module";
+import { NotificationsModule } from "./api/rest/notifications/notifications.module";
+import { SearchModule } from "./api/rest/search/search.module";
+import { SupportModule } from "./api/rest/support/support.module";
+import { HealthModule } from "./health/health.module";
+import { MonitorModule } from "./api/rest/monitor/monitor.module";
+import { SupabaseModule } from "./services/storage/supabase.module";
+import { GeoModule } from "./services/geo/geo.module";
+import { GeoMiddleware } from "./middleware/geo.middleware";
+import { RequestIdMiddleware } from "./middleware/request-id.middleware";
+import { getRequestLogContext } from "./middleware/request-context";
+import { RequestLoggingInterceptor } from "./middleware/request-logging.interceptor";
+import { ErrorResponseInterceptor } from "./middleware/error-response.interceptor";
+import { TikkaThrottlerGuard } from "./middleware/throttler.guard";
+import { validate } from "./config/env.schema";
+import { IndexerBackfillModule } from "./services/indexer/indexer-backfill.module";
+import { MaintenanceModeGuard } from "./maintenance/maintenance-mode.guard";
+import { MaintenanceModeModule } from "./maintenance/maintenance-mode.module";
+import { WebhooksModule } from "./api/rest/webhooks/webhooks.module";
+import { IdempotencyModule } from "./common/idempotency/idempotency.module";
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({ isGlobal: true, validate }),
+    LoggerModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => {
+        const nodeEnv = config.get<string>("NODE_ENV", "development");
+        const isProd = nodeEnv === "production";
+
+        return {
+          pinoHttp: {
+            level: config.get<string>("LOG_LEVEL", isProd ? "info" : "debug"),
+            transport: isProd
+              ? undefined
+              : {
+                  target: "pino-pretty",
+                  options: {
+                    colorize: true,
+                    translateTime: "SYS:standard",
+                    singleLine: true,
+                  },
+                },
+            redact: [
+              "req.headers.authorization",
+              "req.headers.x-admin-token",
+            ],
+            mixin: getRequestLogContext,
+          },
+        };
+      },
+    }),
+
+    /**
+     * Named throttler tiers — each applied by the TikkaThrottlerGuard.
+     *
+     * Tier          Limit      Window    Applies to
+     * ──────────────────────────────────────────────────────────────
+     * default       100 req    60 s      All public endpoints
+     * auth            5 req    15 min    POST /auth/verify
+     * nonce          10 req    60 s      GET  /auth/nonce
+     *
+     * The auth and nonce tiers are overridden at the controller level
+     * via @Throttle() — the values here serve as the fallback defaults
+     * and can be tuned via env vars without a redeploy.
+     *
+     * Override limits via env vars (see .env.example):
+     *   THROTTLE_DEFAULT_LIMIT / THROTTLE_DEFAULT_TTL
+     *   THROTTLE_AUTH_LIMIT    / THROTTLE_AUTH_TTL
+     *   THROTTLE_NONCE_LIMIT   / THROTTLE_NONCE_TTL
+     */
+    ThrottlerModule.forRootAsync({
+      imports: [ConfigModule.forRoot()],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        throttlers: [
+          {
+            name: "default",
+            limit: config.get<number>("THROTTLE_DEFAULT_LIMIT", 100),
+            ttl: seconds(config.get<number>("THROTTLE_DEFAULT_TTL", 60)),
+          },
+          {
+            name: "auth",
+            limit: config.get<number>("THROTTLE_AUTH_LIMIT", 5),
+            ttl: seconds(config.get<number>("THROTTLE_AUTH_TTL", 900)),
+          },
+          {
+            name: "nonce",
+            limit: config.get<number>("THROTTLE_NONCE_LIMIT", 10),
+            ttl: seconds(config.get<number>("THROTTLE_NONCE_TTL", 60)),
+          },
+        ],
+      }),
+    }),
+
+    SupabaseModule,
+    GeoModule,
+    AuthModule,
+    RafflesModule,
+    UsersModule,
+    LeaderboardModule,
+    StatsModule,
+    NotificationsModule,
+    SearchModule,
+    SupportModule,
+    HealthModule,
+    MonitorModule,
+    IndexerBackfillModule,
+    MaintenanceModeModule,
+    WebhooksModule,
+    IdempotencyModule,
+
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => {
+        const redisUrl = config.get<string>('REDIS_URL', '');
+        let host = 'localhost';
+        let port = 6379;
+        if (redisUrl) {
+          try {
+            const url = new URL(redisUrl);
+            host = url.hostname || host;
+            port = parseInt(url.port, 10) || port;
+          } catch {}
+        }
+        return {
+          connection: { host, port },
+          defaultJobOptions: {
+            removeOnComplete: 1000,
+            removeOnFail: 5000,
+          },
+        };
+      },
+    }),
+  ],
+  providers: [
+    // 1. Maintenance guard first — blocks requests when MAINTENANCE_MODE is enabled
+    { provide: APP_GUARD, useClass: MaintenanceModeGuard },
+    // 2. JWT guard second — authenticates the request (sets req.user)
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    // 3. Throttler guard third — rate limits by IP across all named tiers
+    { provide: APP_GUARD, useClass: TikkaThrottlerGuard },
+    // Request logging interceptor with correlation ID
+    { provide: APP_INTERCEPTOR, useClass: RequestLoggingInterceptor },
+    // Error response interceptor to add request ID to error envelopes
+    { provide: APP_INTERCEPTOR, useClass: ErrorResponseInterceptor },
+  ],
+})
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(RequestIdMiddleware).forRoutes('*');
+    consumer.apply(GeoMiddleware).forRoutes('*');
+  }
+}

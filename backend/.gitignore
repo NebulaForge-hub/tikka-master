@@ -1,0 +1,10 @@
+/dist
+/node_modules
+.env
+.env.local
+*.log
+package-lock.json
+package.json
+
+# Backups
+/backups/

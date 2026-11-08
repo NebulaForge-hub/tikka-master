@@ -1,0 +1,50 @@
+import { Module, NestModule, MiddlewareConsumer } from "@nestjs/common";
+import { ConfigModule } from "@nestjs/config";
+import { CacheModule } from "./cache/cache.module";
+import { ProcessorsModule } from "./processors/processors.module";
+import databaseConfig from "./config/database.config";
+import { DatabaseModule } from "./database/database.module";
+import { IngestorModule } from "./ingestor/ingestor.module";
+import { HealthModule } from "./health/health.module";
+import { WebhooksModule } from "./webhooks/webhooks.module";
+import { ApiModule } from "./api/api.module";
+import { MetricsModule } from "./metrics/metrics.module";
+import { MaintenanceModule } from "./maintenance/maintenance.module";
+import { TracingModule } from "./tracing/tracing.module";
+import { RequestIdMiddleware } from "./common/request-id.middleware";
+
+@Module({
+  imports: [
+    // Global config — loads .env and registers the 'database' namespace
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [databaseConfig],
+      // Pick up .env.local in development; Railway / Fly inject real env vars
+      envFilePath: [".env.local", ".env"],
+    }),
+    TracingModule,
+    // TypeORM connection + entity registration + auto-migrations
+    DatabaseModule,
+    // Redis cache layer
+    CacheModule,
+    // Cursor management for ledger ingestion
+    IngestorModule,
+    // Event processors (raffle, ticket, user, stats)
+    ProcessorsModule,
+    WebhooksModule,
+    // Maintenance operations (snapshots, archival)
+    MaintenanceModule,
+    // Health endpoint (lag, DB, Redis)
+    HealthModule,
+    // Internal REST API (raffles, users, leaderboard, stats)
+    ApiModule,
+    // Prometheus metrics exporter
+    MetricsModule,
+  ],
+  controllers: [],
+})
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer.apply(RequestIdMiddleware).forRoutes("*");
+  }
+}

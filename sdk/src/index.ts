@@ -1,0 +1,80 @@
+/**
+ * @packageDocumentation
+ * **@tikka/sdk** — SDK for interacting with the Tikka Soroban raffle contract on Stellar.
+ *
+ * ## Modules
+ * - **Raffle** — create, fetch, list, and cancel raffles
+ * - **Ticket** — buy and refund tickets; query user holdings
+ * - **Wallet** — browser wallet adapters (Freighter, XBull, Albedo, LOBSTR, Rabet)
+ * - **User** — query on-chain participation data
+ * - **Admin** — pause/unpause contract and manage admin rights
+ * - **Network** — RPC / Horizon service configuration
+ * - **Fee Estimator** — estimate transaction fees before signing
+ * - **Utils** — formatting, validation, error classes
+ * - **Auth** — SEP-10 challenge/verification for wallet authentication
+ *
+ * @example
+ * ```ts
+ * import { RaffleService, TicketService, FreighterAdapter } from '@tikka/sdk';
+ * ```
+ */
+
+// ── Contract bindings & types (public API surface) ──────────────────────────
+export { ContractFn, RaffleStatus } from './contract/bindings';
+export { TxResponse } from './contract/response';
+export type { TxMemo } from './contract/contract.service';
+export { TransactionLifecycle } from './contract/lifecycle';
+export {
+  buildUnsignedOfflineTransaction,
+  signTransactionOffline,
+  verifyOfflineSignature,
+} from './contract/offline-signing';
+export type {
+  SimulateResult,
+  SubmitResult,
+  PollConfig,
+  InvokeLifecycleOptions,
+} from './contract/lifecycle';
+export {
+  FIRST_RAFFLE_ID,
+  MAX_RAFFLE_ID,
+  RAFFLE_ID_SPACE_SIZE,
+  RAFFLE_ID_EXHAUSTED_CONTRACT_ERROR_CODE,
+  TERMINAL_RAFFLE_STATUSES,
+  RaffleIdAllocator,
+  allocateRaffleId,
+  isAllowedTransition,
+  isTerminalRaffleStatus,
+  nextRaffleId,
+} from './contract/raffle-id-allocation';
+export type { RaffleIdCounterState, RaffleIdStorageState } from './contract/raffle-id-allocation';
+
+// ── Raffle ──────────────────────────────────────────────────────────────────
+export * from './modules/raffle';
+
+// ── Ticket ──────────────────────────────────────────────────────────────────
+export * from './modules/ticket';
+
+// ── User ────────────────────────────────────────────────────────────────────
+export * from './modules/user';
+
+// ── Admin ───────────────────────────────────────────────────────────────────
+export * from './modules/admin';
+
+// ── Wallet adapters ─────────────────────────────────────────────────────────
+export * from './wallet';
+
+// ── Network ─────────────────────────────────────────────────────────────────
+export * from './network';
+
+// ── Fee estimation ──────────────────────────────────────────────────────────
+export * from './fee-estimator';
+
+// ── Utils ───────────────────────────────────────────────────────────────────
+export * from './utils';
+
+// ── Auth (SEP-10) ───────────────────────────────────────────────────────────
+export * from './auth/sep10';
+
+// ── Schemas ─────────────────────────────────────────────────────────────────
+export * from './schemas/raffle-metadata.schema';

@@ -1,0 +1,154 @@
+import { Logger, Module, OnModuleInit } from "@nestjs/common";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { EventHandlerRegistry } from "./event-handler-registry.service";
+import { EventParserService } from "./event-parser.service";
+import { EVENT_PARSER } from "./event-parser.interface";
+import { IEventHandler } from "./event-handler.interface";
+import { ContractEventTopic } from "./event.types";
+import {
+  assertValidEventHandlerConfig,
+  buildValidationContext,
+  loadEventHandlerConfigFile,
+  DEFAULT_EVENT_HANDLER_CONFIG,
+} from "./event-handler-config";
+
+// Import all default handlers
+import { RaffleCreatedHandler } from "./handlers/raffle-created.handler";
+import { TicketPurchasedHandler } from "./handlers/ticket-purchased.handler";
+import { RaffleFinalizedHandler } from "./handlers/raffle-finalized.handler";
+import {
+  DrawTriggeredHandler,
+  RandomnessRequestedHandler,
+  RandomnessReceivedHandler,
+  RaffleCancelledHandler,
+  TicketRefundedHandler,
+  ContractPausedHandler,
+  ContractUnpausedHandler,
+  AdminTransferProposedHandler,
+  AdminTransferAcceptedHandler,
+} from "./handlers/all-handlers";
+
+/**
+ * Module for extensible event handling system
+ */
+@Module({
+  imports: [ConfigModule],
+  providers: [
+    EventHandlerRegistry,
+    EventParserService,
+    // Bind the parser contract token to EventParserService so ingestion
+    // services depend on IEventParser rather than a concrete class.
+    { provide: EVENT_PARSER, useExisting: EventParserService },
+    // Register all default handler classes
+    RaffleCreatedHandler,
+    TicketPurchasedHandler,
+    RaffleFinalizedHandler,
+    DrawTriggeredHandler,
+    RandomnessRequestedHandler,
+    RandomnessReceivedHandler,
+    RaffleCancelledHandler,
+    TicketRefundedHandler,
+    ContractPausedHandler,
+    ContractUnpausedHandler,
+    AdminTransferProposedHandler,
+    AdminTransferAcceptedHandler,
+  ],
+  exports: [EventHandlerRegistry, EventParserService, EVENT_PARSER],
+})
+export class EventHandlersModule implements OnModuleInit {
+  private readonly logger = new Logger(EventHandlersModule.name);
+
+  constructor(
+    private readonly registry: EventHandlerRegistry,
+    private readonly configService: ConfigService,
+    // Inject all handlers
+    private readonly raffleCreatedHandler: RaffleCreatedHandler,
+    private readonly ticketPurchasedHandler: TicketPurchasedHandler,
+    private readonly raffleFinalizedHandler: RaffleFinalizedHandler,
+    private readonly drawTriggeredHandler: DrawTriggeredHandler,
+    private readonly randomnessRequestedHandler: RandomnessRequestedHandler,
+    private readonly randomnessReceivedHandler: RandomnessReceivedHandler,
+    private readonly raffleCancelledHandler: RaffleCancelledHandler,
+    private readonly ticketRefundedHandler: TicketRefundedHandler,
+    private readonly contractPausedHandler: ContractPausedHandler,
+    private readonly contractUnpausedHandler: ContractUnpausedHandler,
+    private readonly adminTransferProposedHandler: AdminTransferProposedHandler,
+    private readonly adminTransferAcceptedHandler: AdminTransferAcceptedHandler,
+  ) {}
+
+  async onModuleInit() {
+    // Register all default handlers, keyed by contract event topic.
+    //
+    // The record is typed `Record<ContractEventTopic, IEventHandler>`: adding
+    // a topic to the DomainEvent union without registering a default handler
+    // for it here fails the build — the event cannot be parsed until it is
+    // handled.
+    const handlersByTopic: Record<ContractEventTopic, IEventHandler> = {
+      RaffleCreated: this.raffleCreatedHandler,
+      TicketPurchased: this.ticketPurchasedHandler,
+      RaffleFinalized: this.raffleFinalizedHandler,
+      DrawTriggered: this.drawTriggeredHandler,
+      RandomnessRequested: this.randomnessRequestedHandler,
+      RandomnessReceived: this.randomnessReceivedHandler,
+      RaffleCancelled: this.raffleCancelledHandler,
+      TicketRefunded: this.ticketRefundedHandler,
+      ContractPaused: this.contractPausedHandler,
+      ContractUnpaused: this.contractUnpausedHandler,
+      AdminTransferProposed: this.adminTransferProposedHandler,
+      AdminTransferAccepted: this.adminTransferAcceptedHandler,
+    };
+
+    const handlers: IEventHandler[] = Object.values(handlersByTopic);
+
+    for (const handler of handlers) {
+      this.registry.registerDefaultHandler(handler);
+    }
+
+    // Validate the external handler config at boot and fail fast on bad config
+    // so a typo can never silently disable ingestion.
+    this.loadAndApplyConfig(handlers);
+  }
+
+  /**
+   * Loads `config/event-handlers.json` (or the built-in default when absent),
+   * validates it against the registered handlers, and registers the validated
+   * contracts. Throws `ConfigValidationError` on invalid config.
+   */
+  private loadAndApplyConfig(handlers: IEventHandler[]): void {
+    // Build the catalog of available handlers: class name -> event it handles.
+    const availableHandlers = new Map<string, string>(
+      handlers.map((h) => [h.constructor.name, h.eventName]),
+    );
+    const ctx = buildValidationContext(availableHandlers);
+
+    const configPath = this.configService.get<string>(
+      "EVENT_HANDLER_CONFIG_PATH",
+      "config/event-handlers.json",
+    );
+
+    const raw = loadEventHandlerConfigFile(configPath);
+    if (raw === null) {
+      this.logger.warn(
+        `No event handler config found at ${configPath}; using built-in defaults.`,
+      );
+    } else {
+      this.logger.log(`Validating event handler configuration: ${configPath}`);
+    }
+
+    // Throws ConfigValidationError with all issues if the config is invalid.
+    const config = assertValidEventHandlerConfig(
+      raw ?? DEFAULT_EVENT_HANDLER_CONFIG,
+      ctx,
+    );
+
+    for (const contract of config.contracts) {
+      if (contract.enabled) {
+        this.registry.registerContract(contract);
+      }
+    }
+
+    this.logger.log(
+      `Loaded ${config.contracts.filter((c) => c.enabled).length} enabled contract configuration(s)`,
+    );
+  }
+}
